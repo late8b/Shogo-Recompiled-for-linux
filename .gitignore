@@ -1,0 +1,19 @@
+# --- Raw retail assets (not redistributed; regenerable via tools/rezextract.py) ---
+/extracted/
+/embedded/
+
+# --- Derived conversion output (regenerable via tools/dtx2png.py, abc2glb.py) ---
+/converted/
+
+# --- Ghidra project database (regenerable via ghidra/DecompileAll.java) ---
+/ghidra/ShogoMAD.rep/
+/ghidra/ShogoMAD.gpr
+
+# --- Rust build artifacts ---
+/rust/target/
+/target/
+
+# --- Misc ---
+*.rs.bk
+*.pyc
+__pycache__/

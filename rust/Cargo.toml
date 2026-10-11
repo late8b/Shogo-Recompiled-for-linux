@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/shogo-assets", "crates/shogo-viewer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# We disable default features and opt in explicitly, to avoid build-time system
+# dependencies that aren't installed on this machine:
+#   - `audio`/`bevy_audio` -> alsa-sys  (needs libasound system headers)
+#   - `wayland`            -> wayland-sys (needs wayland-client.pc / pkg-config)
+# The `3d` umbrella would pull in `default_platform`, which transitively enables
+# `wayland`; so instead of `3d` we list the pieces it provides, minus wayland.
+# This target runs on X11 (Cinnamon/X11), so `x11` is the windowing backend.
+#   3d_bevy_render = 3d_api (light/mikktspace/ktx2/morph/LUTs) + bevy_render +
+#                    bevy_core_pipeline + bevy_pbr + bevy_gltf + bevy_post_process
+#   default_app    = bevy_asset + bevy_log + bevy_state + async_executor + reflect
+#   scene          = bevy_scene (GLB/SceneRoot loading)
+bevy = { version = "0.20", default-features = false, features = [
+    "3d_bevy_render",
+    "default_app",
+    "scene",
+    "bevy_winit",
+    "x11",
+    "custom_cursor",
+    "multi_threaded",
+    "std",
+    "sysinfo_plugin",
+    "png",
+] }
