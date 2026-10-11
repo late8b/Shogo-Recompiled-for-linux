@@ -250,17 +250,36 @@ Trigger, 75 ObjectLight, 68 SkyPointer, 63 Sound**, plus every powerup
 pos/radius/color, etc.
 
 **Geometry section — header decoded, body pending.** Geometry starts at
-`geometry_offset` (= object-list end). Header layout (locked by anchor scan
-`tools/dat_geom_hdr.py`): **9×u32 + a 2-byte string + 22×u32 lands EXACTLY on the
-texture-table size field**, then:
+`geometry_offset` (= object-list end). Header layout (VERIFIED byte-exact by
+`tools/dat_geom_hdr.py`; `geooff + 9*4 + 2 + 22*4 = geooff + 126` lands precisely
+on the texture-table byte-size field):
+
 ```
-... u32 texture_table_bytes (1637)   u32 nTextures (37)
-@next: nTextures NUL-terminated ".dtx" paths   (e.g. "Textures\Layouts\...dtx")
-... after table: run of per-thing flag bytes (values 3–7, ~2081 bytes)
-... @u32[0] of geometry header (=210907 here): section/lightmap directory
-     u32 nSections, then per section: u16 nameLen, name[] ("Gird1Beam"), + data
+@geooff+0    : 9 x u32     (u32[0] = section/lightmap directory offset; rest 0)
+@geooff+36   : short string (2 bytes)
+@geooff+38   : 22 x u32    (88 bytes) = 12 ints + 3 x vec3(f32) + 1 int
+                 - ints[2..11] are stable count fields across all 22 worlds
+                 - ints[6] == ints[11] in every world (duplicated value)
+                 - the 3 vec3 are grid-snapped bbox-ish coords
+                   (e.g. min=(0,-1600,-960) max=(432,896,256) vec=(2496,0,0))
+@geooff+126  : u32 texture_table_bytes (1637)
+@geooff+130  : u32 nTextures (37)
+@geooff+134  : nTextures NUL-terminated ".dtx" paths (table_bytes total;
+               e.g. "Textures\Layouts\Avernus\Road1.dtx"); ends @39009
 ```
-Header bbox reads as grid-snapped world coords (e.g. −1600,−960,432 … 896,256,2496).
+
+For `MCA_MARITROPA2.DAT` the 12-int block is
+`[0, 202605, 898, 279, 506, 0, 682, 148, 2689, 5101, 123, 682]`; `ints[2..11]` are
+the element-count candidates. The allocation block (`FUN_00418d80` lines
+13118–13139) uses exactly these as counts with byte-multipliers
+(16/52/48/92/36/4/8/16) — that is the size oracle for the body. Field→semantic
+mapping is what the loader port (below) resolves.
+
+**The `@u32[geo]` "section directory" is NOT a simple named-record list.** Its
+first 4 bytes are `nSections` (19 here) and one early record has a name-like
+string ("Gird1Beam"), but a naive `u16 len + name + fixed stride` walk runs off
+the end of the file — the record format is richer and must come from the loader.
+Body+directory spans `39009..210907` = 171898 bytes on disk.
 
 **Authoritative loader: `FUN_00418d80` in `decompiled/Client.exe.c` (lines
 12859–13553, ~700 lines)** — the real geometry parser. Called by world loader
@@ -280,20 +299,24 @@ vertex record w/ UV @0xc), "World %s doesn't have PBlocks" `FUN_004129b0`
 **Working & verified (do not re-do):** REZ extraction, DTX→PNG, SPR, ABC→GLB,
 Rust `shogo-assets` decoders (DTX+ABC, tested), Bevy `shogo-viewer` MVP (renders
 original ABC via Vulkan), DAT object/property grammar (verified on all 22 worlds),
-DAT geometry header + texture table.
+DAT geometry header + texture table (header byte-offsets verified across all 22
+worlds; the 11 count fields `ints[2..11]` identified).
 
 **Recommended priority for the next agent:**
 
 1. **World polygon geometry (the one hard asset format left).** Do NOT keep
    empirical-guessing flat vertex arrays — the mesh is a leaf/portal tree and
-   flat scans fail. Instead **faithfully port the decompiled loader
-   `FUN_00418d80`** (`decompiled/Client.exe.c` lines 12859–13553) read-by-read
+   flat scans fail. The header is now fully decoded (`tools/dat_geom_hdr.py`,
+   `--scan`), including the count fields, so the port can start from the body.
+   **Faithfully port the decompiled loader `FUN_00418d80`**
+   (`decompiled/Client.exe.c` lines 12859–13553) read-by-read
    into Python, exactly as `tools/ltabc.py` did for the ABC loader
    `FUN_00434ad0`. Validate against the known anchors: texture count=37, table
-   bytes=1637, header bbox grid-snapped coords. Element sizes from the
-   allocation block (lines 13118–13139): 16/52/48/92/36 bytes. Once positions+
-   faces+UVs+per-surface texture index come out in-range, export a world GLB
-   (mirror `tools/abc2glb.py`) and add a native `dat` decoder to `shogo-assets`.
+   bytes=1637, body+dir spans `39009..210907`, header bbox grid-snapped coords.
+   Element sizes from the allocation block (lines 13118–13139): 16/52/48/92/36
+   bytes. Once positions+ faces+UVs+per-surface texture index come out in-range,
+   export a world GLB (mirror `tools/abc2glb.py`) and add a native `dat` decoder
+   to `shogo-assets`.
 
 2. **Wire textures into the viewer.** ABC files carry NO .dtx references
    (verified on all models) — textures are assigned by game logic. World surfaces
