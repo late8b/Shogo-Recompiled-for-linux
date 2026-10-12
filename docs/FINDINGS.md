@@ -209,7 +209,7 @@ Each face is a triangle with its own 3 UVs → expand per-corner to preserve UV
 seams. Tools: `tools/ltabc.py` (parser) + `tools/abc2glb.py` (exporter).
 Validated: 538/538 models, exact consumption, indices in range.
 
-### DAT worlds — objects/geometry-header DECODED; polygon mesh PENDING
+### DAT worlds — objects + WorldBSP geometry DECODED (v56)
 
 **Header (verified across all 22 retail worlds):**
 ```
@@ -249,92 +249,76 @@ Trigger, 75 ObjectLight, 68 SkyPointer, 63 Sound**, plus every powerup
 `tools/dat_extract_objects.py <glob>` prints spawn positions, light
 pos/radius/color, etc.
 
-**Geometry section — header decoded, body pending.** Geometry starts at
-`geometry_offset` (= object-list end). Header layout (VERIFIED byte-exact by
-`tools/dat_geom_hdr.py`; `geooff + 9*4 + 2 + 22*4 = geooff + 126` lands precisely
-on the texture-table byte-size field):
+**Geometry (DAT v56 WorldBSP) — DECODED & VERIFIED on all 60 worlds.**
+Tools: `tools/ltdat.py` (parser) + `tools/dat2glb.py` (exporter). Layout matches
+haekb `bspv56.bt` and `FUN_00418d80` count slots.
 
 ```
-@geooff+0    : 9 x u32     (u32[0] = section/lightmap directory offset; rest 0)
-@geooff+36   : short string (2 bytes)
-@geooff+38   : 22 x u32    (88 bytes) = 12 ints + 3 x vec3(f32) + 1 int
-                 - ints[2..11] are stable count fields across all 22 worlds
-                 - ints[6] == ints[11] in every world (duplicated value)
-                 - the 3 vec3 are grid-snapped bbox-ish coords
-                   (e.g. min=(0,-1600,-960) max=(432,896,256) vec=(2496,0,0))
-@geooff+126  : u32 texture_table_bytes (1637)
-@geooff+130  : u32 nTextures (37)
-@geooff+134  : nTextures NUL-terminated ".dtx" paths (table_bytes total;
-               e.g. "Textures\Layouts\Avernus\Road1.dtx"); ends @39009
+@geooff+0    : u32 next_section (named-section dir, after this BSP)
+             + 8 x u32 pad (0)
+@geooff+36   : 2 bytes (name slot; "m\\0" on small maps, non-NUL pair on large)
+@geooff+38   : 12 x u32 counts
+                 [0] InfoFlags
+                 [1] NextPosition          (end of this BSP, ~body_end)
+                 [2] PointCount
+                 [3] PlaneCount            (16B: normal + distance)
+                 [4] SurfaceCount
+                 [5] UserPortalCount
+                 [6] PolyCount
+                 [7] LeafCount
+                 [8] VertCount
+                 [9] TotalVisListSize
+                 [10] LeafListCount
+                 [11] NodeCount
+             + u32 unknown2
+             + 3 x vec3 (min, max, translation)
+             + u32 texture_table_bytes
+             + u32 nTextures
+             + nTextures NUL-terminated ".dtx" paths
+Body (in order):
+  Vertex[PolyCount]     u8 count, u8 extra
+  Leaf[LeafCount]       vis-list (u16==0xFFFF ? ref : data) + poly indices + f32
+  Plane[PlaneCount]     16B
+  Surface[SurfaceCount] 6 x vec3 (O/P/Q + 3 unused), u16 tex, i32 plane,
+                        u32 flags, 4B, u8 useEffects [? 2 x LTString], u16 texFlags
+  Polygon[PolyCount]    i16 lmW, i16 lmH, 2 x f32, i32 surface,
+                        (count+extra) x DiskVert{i16 pointIndex, 3B}
+  Node[NodeCount]       4+4+2+4+4+16
+  Portal[UserPortalCount]
+  Point[PointCount]     vec3
+  PBlockTable           u32 x,y,z; 2 x vec3; then x*y*z blocks (i16 n, i16, n*6)
 ```
 
-For `MCA_MARITROPA2.DAT` the 12-int block is
-`[0, 202605, 898, 279, 506, 0, 682, 148, 2689, 5101, 123, 682]`; `ints[2..11]` are
-the element-count candidates. The allocation block (`FUN_00418d80` lines
-13118–13139) uses exactly these as counts with byte-multipliers
-(16/52/48/92/36/4/8/16) — that is the size oracle for the body. Field→semantic
-mapping is what the loader port (below) resolves.
+MCA_MARITROPA2: 898 pts, 682 polys, 506 surfs, 37 textures; point indices in
+range; PBlock end 202601 ≈ NextPosition 202605. Exporter fans polys, OPQ UVs
+`u=P·pos+O.x, v=Q·pos+O.y`, Z-up→Y-up. **60/60 worlds → GLB.**
 
-**The `@u32[geo]` "section directory" is NOT a simple named-record list.** Its
-first 4 bytes are `nSections` (19 here) and one early record has a name-like
-string ("Gird1Beam"), but a naive `u16 len + name + fixed stride` walk runs off
-the end of the file — the record format is richer and must come from the loader.
-Body+directory spans `39009..210907` = 171898 bytes on disk.
+Section directory @ `next_section` (e.g. 19 named brushes "Gird1Beam") is still
+richer than a flat name list; not needed for the root mesh.
 
-**Authoritative loader: `FUN_00418d80` in `decompiled/Client.exe.c` (lines
-12859–13553, ~700 lines)** — the real geometry parser. Called by world loader
-`FUN_00418980` (line 12703, "World load: %d ticks"). Array allocation (lines
-13118–13139) reveals element sizes: **16B planes, 52B vertices (in-memory form),
-48B surfaces, 92B portals, 36B leaves**. The mesh is stored as a **leaf/portal
-tree**, NOT flat arrays — empirical flat-array scans (stride 52/34, position@0/14/18)
-returned 0 world-scale candidates. A faithful port of `FUN_00418d80`'s read
-sequence is required (same technique that cracked REZ/DTX/ABC).
-
-Other loader refs: `FUN_00434270` (world-geometry UV/stage builder, 28-byte
-vertex record w/ UV @0xc), "World %s doesn't have PBlocks" `FUN_004129b0`
-(physics octree), "World ended" `FUN_00454160` (teardown).
+Other loader refs: `FUN_00434270` (runtime UV/stage builder), `FUN_004129b0`
+(PBlocks physics octree), `FUN_00454160` (teardown).
 
 ## Next steps (state as of end of session)
 
-**Working & verified (do not re-do):** REZ extraction, DTX→PNG, SPR, ABC→GLB,
-Rust `shogo-assets` decoders (DTX+ABC, tested), Bevy `shogo-viewer` MVP (renders
-original ABC via Vulkan), DAT object/property grammar (verified on all 22 worlds),
-DAT geometry header + texture table (header byte-offsets verified across all 22
-worlds; the 11 count fields `ints[2..11]` identified).
+**Working & verified (do not re-do):** REZ, DTX→PNG, SPR, ABC→GLB, Rust
+`shogo-assets` (DTX+ABC), Bevy ABC viewer, DAT objects (22 worlds), DAT v56
+WorldBSP mesh (60/60 worlds, `ltdat.py` / `dat2glb.py`).
 
 **Recommended priority for the next agent:**
 
-1. **World polygon geometry (the one hard asset format left).** Do NOT keep
-   empirical-guessing flat vertex arrays — the mesh is a leaf/portal tree and
-   flat scans fail. The header is now fully decoded (`tools/dat_geom_hdr.py`,
-   `--scan`), including the count fields, so the port can start from the body.
-   **Faithfully port the decompiled loader `FUN_00418d80`**
-   (`decompiled/Client.exe.c` lines 12859–13553) read-by-read
-   into Python, exactly as `tools/ltabc.py` did for the ABC loader
-   `FUN_00434ad0`. Validate against the known anchors: texture count=37, table
-   bytes=1637, body+dir spans `39009..210907`, header bbox grid-snapped coords.
-   Element sizes from the allocation block (lines 13118–13139): 16/52/48/92/36
-   bytes. Once positions+ faces+UVs+per-surface texture index come out in-range,
-   export a world GLB (mirror `tools/abc2glb.py`) and add a native `dat` decoder
-   to `shogo-assets`.
+1. **Add a native `dat` decoder to `shogo-assets`** (port `tools/ltdat.py`) and
+   load original `.DAT` in `shogo-viewer` the same way ABC already loads.
+   Texture worlds via `shogo-assets::dtx` + per-surface texture index →
+   `StandardMaterial.base_color_texture`. ABC models still have no .dtx refs
+   (`mod3_Object.dll` later).
 
-2. **Wire textures into the viewer.** ABC files carry NO .dtx references
-   (verified on all models) — textures are assigned by game logic. World surfaces
-   DO carry texture indices (into the .dtx table), so once (1) works, world
-   geometry gets textured via `shogo-assets::dtx` → `StandardMaterial`
-   base_color_texture. For standalone models, texture assignment requires
-   reversing material→texture mapping from `mod3_Object.dll` (lower priority).
+2. **Begin the gameplay rewrite.** Physics (PBlocks `FUN_004129b0`), AI,
+   MCA/on-foot, weapons from `Client.exe` + `mod2_CShellRef.dll` /
+   `mod3_Object.dll` / `server.dll`. Spawns/lights/doors/triggers are extracted.
 
-3. **Begin the gameplay rewrite.** Port physics (PBlocks octree, `FUN_004129b0`),
-   AI, MCA/on-foot modes, weapon semantics from `Client.exe` +
-   `mod2_CShellRef.dll` / `mod3_Object.dll` / `server.dll`. Spawn points, lights,
-   doors, triggers are already extracted (see DAT section) — that's the level
-   skeleton.
-
-4. Optional: recover class-registration tables for real field names; get the
-   original running under Wine for reference; cross-check community LithTech 1.0
-   knowledge (OpenLith, ReZolved) — note: web search returned nothing useful
-   earlier (tool appeared unavailable), so re-try if needed.
+3. Optional: extra WorldModels after the root BSP; named section directory;
+   class-registration field names; Wine reference play.
 
 **Environment reminders:** Rust at `~/.cargo` (`source ~/.cargo/env`); Bevy 0.20
 built with a restricted feature set (X11 only, NO audio/wayland) to avoid missing

@@ -18,8 +18,8 @@ asset-format specs, recovered C++ class names).
 | ABC models → glTF | **Done** — 538 / 538 models, exact byte consumption |
 | Rust asset decoders | **Done** — `shogo-assets` (DTX + ABC), unit-tested + parity vs all retail assets |
 | Bevy native viewer | **Done (MVP)** — loads original .ABC directly, orbit camera, renders via Vulkan |
-| DAT world objects/properties | **Done** — grammar verified on all 22 worlds; spawns/lights/doors/triggers/powerups extracted |
-| DAT world geometry | **Partial** — header + texture table decoded; polygon mesh (leaf/portal tree) needs a faithful port of loader `FUN_00418d80` |
+| DAT world objects/properties | **Done** — grammar verified; spawns/lights/doors/triggers/powerups extracted |
+| DAT world geometry | **Done** — v56 WorldBSP (points/surfs/polys/OPQ UVs) on all 60 worlds; `ltdat.py` + `dat2glb.py` |
 | Full gameplay rewrite | Not started |
 
 ## Repository layout
@@ -31,12 +31,15 @@ tools/                    Python pipeline (extraction + format decoders)
   dtx2png.py              DTX texture -> PNG (single + --batch)
   ltabc.py                ABC model parser
   abc2glb.py              ABC -> glTF 2.0 binary (.glb) exporter
+  ltdat.py                DAT v56 WorldBSP parser
+  dat2glb.py              DAT world -> glTF 2.0 binary (.glb) exporter
 extracted/                raw assets pulled from the REZ archives
   SOUND/                  2,023 WAV files
   SHOGO/                  models (.ABC), worlds (.DAT), textures (.DTX), ...
 converted/                ready-to-use assets
   textures/               PNG (mirrors the DTX tree)
   models/                 .glb (mirrors the ABC tree)
+  worlds/                 .glb (mirrors the DAT tree)
 rust/                     Cargo workspace
   crates/shogo-assets/    native DTX + ABC decoders (no Bevy dependency)
   crates/shogo-viewer/    Bevy app: GLB viewer with orbit camera
@@ -58,6 +61,9 @@ python3 tools/abc2glb.py --batch extracted/SHOGO/MODELS converted/models
 
 # a single model
 python3 tools/abc2glb.py extracted/SHOGO/MODELS/CHARACTERS/GABRIEL.ABC gabriel.glb
+
+# worlds -> glTF binary
+python3 tools/dat2glb.py --batch extracted/SHOGO/WORLDS converted/worlds
 ```
 
 `.glb` files load directly in Blender (File → Import → glTF 2.0) and in the
@@ -107,12 +113,13 @@ Full detail in `docs/FINDINGS.md`.
   bbox + name table + N×33-byte triangles (3 UV pairs + 3 indices + flags) +
   N×20-byte vertices (12 = position). Each face carries its own UVs.
 - **SPR** — just a path pointer to a DTX.
-- **DAT** — DEdit world: text header, object/entity list (spawns, lights,
-  triggers with Pos/Rotation), then polygon geometry (in progress).
+- **DAT** — DEdit world (v56): object/entity list (spawns, lights, triggers
+  with Pos/Rotation), then WorldBSP (points, surfaces with OPQ UVs, polygons).
+  `tools/ltdat.py`, `tools/dat2glb.py`.
 
 ## Goals / roadmap
 
-1. **Asset conversion** — ✅ textures and models; worlds pending.
+1. **Asset conversion** — ✅ textures, models, and worlds.
 2. **Native Linux runtime** — a Bevy app that loads the original assets
    directly (via `shogo-assets`) rather than a converted intermediate.
 3. **Preserve the player runtime** — keep the original behavior (physics, AI,
