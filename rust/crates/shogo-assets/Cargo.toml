@@ -3,7 +3,7 @@ name = "shogo-assets"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Native decoders for Shogo: MAD LithTech 1.0 asset formats (DTX, ABC)"
+description = "Native decoders for Shogo: MAD LithTech 1.0 asset formats (DTX, ABC, DAT)"
 
 [dependencies]
 # Intentionally dependency-free: raw format decoding only.

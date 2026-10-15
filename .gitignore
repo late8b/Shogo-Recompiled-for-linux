@@ -17,3 +17,5 @@
 *.rs.bk
 *.pyc
 __pycache__/
+rust/target-ui/
+rust/target-lock/

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/shogo-assets", "crates/shogo-viewer"]
+members = ["crates/shogo-assets", "crates/shogo-viewer", "crates/shogo-game"]
 
 [workspace.package]
 version = "0.1.0"
@@ -30,4 +30,8 @@ bevy = { version = "0.20", default-features = false, features = [
     "std",
     "sysinfo_plugin",
     "png",
+    "bevy_ui",
+    "bevy_ui_render",
+    "bevy_text",
+    "default_font",
 ] }

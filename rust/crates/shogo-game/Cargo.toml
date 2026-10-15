@@ -1,0 +1,13 @@
+[package]
+name = "shogo-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shogo gameplay rewrite: input, HUD, and the player loop"
+
+[dependencies]
+shogo-assets = { path = "../shogo-assets" }
+bevy = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

@@ -25,46 +25,86 @@ runtime path is the Rust decoders.
   data`; Geometry = bbox + name table + nFaces×33B + nVerts×20B). 538/538 models,
   exact byte consumption, indices valid. `tools/ltabc.py`, `tools/abc2glb.py`
   (Z-up→Y-up, UV v'=1-v, smooth normals).
-- **Rust workspace** (`rust/`): `shogo-assets` (native DTX + ABC decoders, tests
-  3/3 pass, parity vs every retail asset) + `shogo-viewer` (Bevy 0.20, loads
-  original .ABC directly, auto-framed orbit camera, renders via Vulkan —
-  screenshot confirmed). Compiles clean; release binary built.
+- **Rust workspace** (`rust/`): `shogo-assets` (DTX, ABC with `static_model`
+  bind pose, DAT v56 geometry + `GameStartPoint` + level actors) and
+  `shogo-viewer` (Bevy 0.20). Tests: `cargo test -p shogo-assets --lib` and
+  `cargo test -p shogo-viewer`.
 - **Ghidra** wired to Temurin JDK 21; all binaries decompiled to `decompiled/`
   (6,455 functions). `server.dll.c` + `Client.exe.c` are the key references.
 - **DAT object/property grammar** — cracked & verified on all 22 worlds (byte
   consumption exact). 3442 Light, 222 GameStartPoint, 309 doors, 112 triggers,
   all powerups extracted with positions/colors/radii.
 
-## What is DONE (new) — DAT v56 WorldBSP
-Root-model mesh is decoded on **all 60 worlds**: points, planes, surfaces
-(OPQ UVs + texture index), polygons (fan), nodes, portals, PBlocks.
-`tools/ltdat.py` (indices in-range) + `tools/dat2glb.py` → `converted/worlds/`
-(60/60 GLB). MCA_MARITROPA2: 898 pts, 682 polys, 4447 tris, 37 materials.
+## What is DONE — native world + mission 1
 
-Name slot after the 9-u32 WorldModel header is **always 2 bytes** (not a
-C-string — large maps put a non-NUL pair there). Count mapping is bspv56:
-Point/Plane/Surface/Portal/Poly/Leaf/Vert/Vis/LeafList/Node.
+Root-model mesh is decoded on **all 60 worlds** (Python and Rust): points,
+planes, surfaces (OPQ UVs + texture index), polygons. `tools/ltdat.py` +
+`tools/dat2glb.py` still write `converted/worlds/` (60/60 GLB). The name slot
+after the 9-u32 WorldModel header is **always 2 bytes**.
+
+The Bevy app loads the original `.DAT` and binds DTX textures. Default world
+is **The Ambush** (`WORLDS/01_AMBUSH.DAT`). `SHOGO_WORLD` selects any other
+file. `MCA_MARITROPA2.DAT` has no character classes, so it still runs the
+wave sandbox.
+
+Playable slice, verified in the window:
+
+- Menu on `INTERFACE/MENU/BACKGRND.PCX`. New Game, Continue, Quit.
+- Intro card `INTERFACE/BUMPERS/AMBUSH.PCX` (Shinara District), then the mission.
+- Player at `start1` `(3072, 32, 2688)`. Authored cast from the object list:
+  8 hostiles (Cronian troopers, Ruin 150s, Sparrowhawk, Vigilance, two Fallen
+  Andra 10s) and 3 UCA escorts who do not shoot or take damage. Dropships and
+  APCs keep authored height. Trucks sit on the road.
+- Character ABC pieces are posed with the parent chain in `static_model`.
+  Faction skins are `SKINS/ENEMIES/{STEM}_{FACTION}.DTX`.
+- On-foot and MCA movement, assault rifle and pulse rifle, autoreload, HUD.
+- Sphere collision and a nav grid. This is not the retail PBlock octree.
+- One continue file: `~/.local/share/shogo-mad/continue.sav` (override with
+  `SHOGO_SAVE`). Autosave at deploy, F5, and the pause menu. Continue skips
+  the bumper and restores position, health, ammo, and body.
+- Music: `paplay` loops `SOUND/INTERFACE/LOOP3.WAV` on the menu, plays
+  `BUMPER.WAV` into the intro, then `AMBIENT/MUSIC1.WAV` into `WIND3.WAV`.
+  `SHOGO_MUTE=1` skips it. Bevy's audio feature stays off (no ALSA headers).
+
+## Decompilation state
+
+`decompiled/` is a Ghidra dump of the retail binaries: 6,455 functions,
+`FUN_` names, not a source tree that builds. `Client.exe.c` and `server.dll.c`
+are the references for loaders and physics. The Rust game is a behavior
+rewrite on top of the decoded assets, not a translation of those functions.
+
+Still only in the dump, not in the runtime:
+
+- Mission script: triggers, objectives, transmissions, doors, AI keys, patrols.
+- Retail physics (`FUN_004129b0`, PBlocks).
+- The rest of the campaign after Ambush, inventory, and the original weapon set.
+- Extra WorldModels after the root BSP, and the named section directory.
 
 ## NEXT ACTION (priority order)
-1. **Native `dat` decoder in `shogo-assets`** + load original `.DAT` in
-   `shogo-viewer`. Bind DTX textures from surface indices.
-2. **Gameplay rewrite**: physics (PBlocks `FUN_004129b0`), AI, MCA/on-foot,
-   weapons. Level skeleton (spawns/lights/doors/triggers) is extracted.
-3. Optional: extra WorldModels after the root BSP; named section directory.
+1. **Ambush as a mission, not a sandbox.** Read `Trigger` / `AIKey` /
+   `ObjectiveTrigger` / `TransmissionTrigger` from `01_AMBUSH.DAT` and drive
+   the escorts and the Cronian squad from those, instead of the chase AI.
+2. **Doors and the exit.** `DestructableDoor`, `Door`, and `ExitTrigger`
+   (`outtahere` at the Ambush exit).
+3. **Physics closer to LithTech.** PBlocks in the DAT are parsed by `ltdat.py`
+   but the viewer still uses a triangle mesh and a sphere.
+4. Optional: campaign flow into `02_QUARTERS.DAT`; extra WorldModels.
 
 ## Key files
 - `docs/FINDINGS.md` — master spec (REZ/DTX/SPR/ABC/DAT formats, class names).
 - `README.md` — overview + status table + quick start.
 - `tools/` — Python converters (`dtx2png.py`, `abc2glb.py`, `ltabc.py`,
   `ltdat.py`, `dat2glb.py`, `dat_extract_objects.py`, …).
-- `rust/crates/shogo-assets/src/{dtx.rs,abc.rs}` — native decoders.
-- `rust/crates/shogo-viewer/src/main.rs` — Bevy viewer (loads original ABC).
-- `rust/Cargo.toml` — Bevy 0.20 feature set rationale (X11-only, no audio/wayland).
+- `rust/crates/shogo-assets/src/{dtx.rs,abc.rs,dat.rs}` — native decoders.
+- `rust/crates/shogo-viewer/src/` — `main.rs` world load, `front.rs` menu /
+  intro / save, `combat.rs` cast and weapons, `tune.rs` WAV playback,
+  `collide.rs`, `nav.rs`, `arena.rs`, `input.rs`, `pad.rs`.
+- `rust/Cargo.toml` — Bevy 0.20 features (X11, UI, no `bevy_audio`, no wayland).
 - `decompiled/Client.exe.c` — world/model loaders (`FUN_00418d80` geometry,
   `FUN_00434ad0` ABC geometry, `FUN_00434270` world UV builder).
 - `decompiled/server.dll.c` — object/property loader `FUN_10007372` (Light props).
-- `extracted/SHOGO/` — 5,643 assets; `WORLDS/MULTI/MCA_MARITROPA2.DAT` is the
-  representative world (272,654 B).
+- `extracted/SHOGO/WORLDS/01_AMBUSH.DAT` — the mission the runtime boots.
+  `WORLDS/MULTI/MCA_MARITROPA2.DAT` is the wave-sandbox map.
 
 ## Environment
 - Linux Mint 22.3 (Cinnamon/X11), `DISPLAY=:0`; JDK 21 `~/.local/opt/jdk-21...`;
@@ -72,5 +112,7 @@ Point/Plane/Surface/Portal/Poly/Leaf/Vert/Vis/LeafList/Node.
   PIL 10.2.0; cc 13.3.0.
 - Vulkan works (AMD RADV RENOIR / Mesa). No x11/wayland/alsa/vulkan `-dev`
   headers → Bevy built with restricted features (see `rust/Cargo.toml`).
-- Viewer run: `cd rust && SHOGO_MODEL=../extracted/SHOGO/MODELS/CHARACTERS/GABRIEL.ABC WGPU_BACKEND=vulkan cargo run --release -p shogo-viewer`.
+- Game: `cd rust && WGPU_BACKEND=vulkan cargo run -p shogo-viewer`.
+  `SHOGO_SKIP_MENU=1` skips the title. `SHOGO_GRAB=0` leaves the mouse free.
+  A wireless DualSense needs the user in group `input`; keyboard still works.
 - Git repo exists (`master`). Converted GLBs are gitignored (regenerate via tools).

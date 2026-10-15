@@ -16,11 +16,12 @@ asset-format specs, recovered C++ class names).
 | REZ archive extraction | **Done** — both retail archives fully extracted & validated |
 | DTX textures → PNG | **Done** — 3,641 / 3,675 decoded (34 are zero-dim placeholders) |
 | ABC models → glTF | **Done** — 538 / 538 models, exact byte consumption |
-| Rust asset decoders | **Done** — `shogo-assets` (DTX + ABC), unit-tested + parity vs all retail assets |
-| Bevy native viewer | **Done (MVP)** — loads original .ABC directly, orbit camera, renders via Vulkan |
-| DAT world objects/properties | **Done** — grammar verified; spawns/lights/doors/triggers/powerups extracted |
-| DAT world geometry | **Done** — v56 WorldBSP (points/surfs/polys/OPQ UVs) on all 60 worlds; `ltdat.py` + `dat2glb.py` |
-| Full gameplay rewrite | Not started |
+| Rust asset decoders | **Done** — `shogo-assets` (DTX, ABC bind pose, DAT v56), unit-tested |
+| Bevy runtime | **Mission 1 playable** — original DAT/ABC/DTX/PCX/WAV, menu, bumper, combat, save |
+| DAT world objects/properties | **Done** — grammar verified; campaign cast is placed from the object list |
+| DAT world geometry | **Done** — v56 WorldBSP on all 60 worlds; native decoder plus `ltdat.py` / `dat2glb.py` |
+| Ghidra decompilation | **Reference only** — 6,455 functions in `decompiled/`; not a rebuilt executable |
+| Full campaign / original AI | Not started — triggers, objectives, doors, and scripted patrols are still in the dump |
 
 ## Repository layout
 
@@ -41,8 +42,8 @@ converted/                ready-to-use assets
   models/                 .glb (mirrors the ABC tree)
   worlds/                 .glb (mirrors the DAT tree)
 rust/                     Cargo workspace
-  crates/shogo-assets/    native DTX + ABC decoders (no Bevy dependency)
-  crates/shogo-viewer/    Bevy app: GLB viewer with orbit camera
+  crates/shogo-assets/    native DTX, ABC, and DAT decoders (no Bevy dependency)
+  crates/shogo-viewer/    Bevy runtime: menu, Ambush, combat, save
 embedded/                 the 4 game-logic DLLs extracted from SHOGO.REZ
 decompiled/               Ghidra decompiler output (6,455 functions)
 ghidra/                   headless decompile script
@@ -66,33 +67,52 @@ python3 tools/abc2glb.py extracted/SHOGO/MODELS/CHARACTERS/GABRIEL.ABC gabriel.g
 python3 tools/dat2glb.py --batch extracted/SHOGO/WORLDS converted/worlds
 ```
 
-`.glb` files load directly in Blender (File → Import → glTF 2.0) and in the
-Bevy viewer below.
+`.glb` files load in Blender (File → Import → glTF 2.0). The Bevy app does
+not use them; it reads the retail DAT, ABC, and DTX files.
 
-### Run the native viewer (Rust + Bevy)
+### Run the game (Rust + Bevy)
 
-The viewer does **not** go through a converted intermediate — it loads the
-**original `.ABC` model directly** via the `shogo-assets` decoder and builds a
-Bevy mesh from it. This is the native-runtime path: original game asset → Rust
-decoder → Bevy render, with no conversion step at runtime.
+The runtime loads retail files directly: `01_AMBUSH.DAT`, character `.ABC`
+files, `.DTX` textures, menu `.PCX` art, and `.WAV` music. Nothing is converted
+first.
 
 ```bash
 cd rust
-# point it at an original model from the extraction:
-SHOGO_MODEL=../extracted/SHOGO/MODELS/CHARACTERS/GABRIEL.ABC cargo run --release -p shogo-viewer
+WGPU_BACKEND=vulkan cargo run -p shogo-viewer
 ```
 
-Right-drag to orbit, scroll to zoom. The camera auto-frames the model bounds.
+The window opens on the original menu. **New Game** plays the Shinara District
+bumper, then starts **The Ambush** at the authored `start1` point. **Continue**
+reloads `~/.local/share/shogo-mad/continue.sav` and skips the bumper. **Esc**
+pauses. **F5** quicksaves.
 
-Build notes (see `rust/Cargo.toml`): Bevy is built with `default-features =
-false` plus an explicit feature list so it needs **no system dev headers** —
-`audio` (alsa) and `wayland` (pkg-config) are disabled, and windowing is X11.
-This matches the target machine (Cinnamon/X11, Mesa Vulkan).
-
-Run the native decoders' tests, and validate against every retail asset:
+On foot: mouse or right stick looks, WASD or the left stick moves, Shift or L3
+sprints, Space or Cross jumps, left click or R2 fires, right click or L2 aims,
+R or Square reloads, Q or Triangle cycles weapons, 1 / 2 pick the rifle, F or
+D-pad Up toggles the MCA. Click, Enter, or Cross respawns.
 
 ```bash
-cd rust && cargo test -p shogo-assets
+# another retail world (the multi map still runs the wave sandbox)
+SHOGO_WORLD=../extracted/SHOGO/WORLDS/MULTI/MCA_MARITROPA2.DAT cargo run -p shogo-viewer
+
+# one model, orbit camera
+SHOGO_MODEL=../extracted/SHOGO/MODELS/CHARACTERS/GABRIEL.ABC cargo run -p shogo-viewer
+
+SHOGO_SKIP_MENU=1   # boot straight into the world
+SHOGO_MUTE=1        # no paplay
+SHOGO_GRAB=0        # leave the mouse free
+SHOGO_SAVE=/tmp/continue.sav
+```
+
+Build notes (see `rust/Cargo.toml`): Bevy is built with `default-features =
+false` plus an explicit feature list so it needs **no system dev headers**.
+`bevy_audio` stays off (that needs ALSA headers). Music is the retail WAVs
+played through `paplay`. Windowing is X11. UI uses `bevy_ui` / `bevy_text`.
+
+```bash
+cd rust
+cargo test -p shogo-assets --lib
+cargo test -p shogo-viewer
 cargo run --release --example decode_all -p shogo-assets -- ../extracted/SHOGO
 #   ABC  ok=538  fail=0  total_tris=98534
 #   DTX  ok=4638 fail=34  (the 34 are zero-dimension placeholders)
@@ -111,7 +131,9 @@ Full detail in `docs/FINDINGS.md`.
   then 8-bit indices per mip. `GLASS/` uses a 16-bit variant.
 - **ABC** — property tree (`u16 nameLen, name, u32 endOffset, data`). Geometry =
   bbox + name table + N×33-byte triangles (3 UV pairs + 3 indices + flags) +
-  N×20-byte vertices (12 = position). Each face carries its own UVs.
+  N×20-byte vertices (12 = position). Each face carries its own UVs. Character
+  pieces are parent-local; `static_model` is applied as a bind pose so the
+  figure stands in one mesh.
 - **SPR** — just a path pointer to a DTX.
 - **DAT** — DEdit world (v56): object/entity list (spawns, lights, triggers
   with Pos/Rotation), then WorldBSP (points, surfaces with OPQ UVs, polygons).
@@ -119,14 +141,16 @@ Full detail in `docs/FINDINGS.md`.
 
 ## Goals / roadmap
 
-1. **Asset conversion** — ✅ textures, models, and worlds.
-2. **Native Linux runtime** — a Bevy app that loads the original assets
-   directly (via `shogo-assets`) rather than a converted intermediate.
-3. **Preserve the player runtime** — keep the original behavior (physics, AI,
-   weapon semantics, MCA/on-foot modes) reproducible; the decompiled
-   `decompiled/` output is the ground-truth reference.
-4. **Gameplay rewrite** — port game logic (currently in `Client.exe` +
-   `mod2_CShellRef.dll` / `mod3_Object.dll`) to Rust, module by module.
+1. **Asset conversion** — done for textures, models, and worlds.
+2. **Native Linux runtime** — done for loading. The Bevy app reads original
+   DAT, ABC, DTX, PCX, and WAV through `shogo-assets` and a small PCX/WAV path.
+3. **Decompilation** — Ghidra has dumped `Client.exe`, `server.dll`, and the
+   four game DLLs to `decompiled/` (6,455 functions). That tree is the
+   reference. It is not cleaned up and it does not build.
+4. **Gameplay rewrite** — mission 1 is playable (menu, bumper, authored cast,
+   two weapons, on-foot/MCA, one continue file). Triggers, objectives, doors,
+   transmissions, patrol keys, and the retail physics octree are still only in
+   the decompiler output.
 
 ## Licensing note
 

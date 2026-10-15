@@ -299,28 +299,33 @@ richer than a flat name list; not needed for the root mesh.
 Other loader refs: `FUN_00434270` (runtime UV/stage builder), `FUN_004129b0`
 (PBlocks physics octree), `FUN_00454160` (teardown).
 
-## Next steps (state as of end of session)
+## Runtime and decompilation (state as of 2026-10-15)
 
-**Working & verified (do not re-do):** REZ, DTX→PNG, SPR, ABC→GLB, Rust
-`shogo-assets` (DTX+ABC), Bevy ABC viewer, DAT objects (22 worlds), DAT v56
-WorldBSP mesh (60/60 worlds, `ltdat.py` / `dat2glb.py`).
+**Decompilation.** `decompiled/` is the Ghidra dump: 6,455 functions from
+`Client.exe`, `server.dll`, and the four DLLs that live inside `SHOGO.REZ`.
+Names are still `FUN_`. Nothing in that tree is compiled or linked. It is the
+reference for behavior the Rust runtime has not reimplemented. Loaders called
+out above (`FUN_00418d80`, `FUN_00434ad0`, `FUN_00434270`, `FUN_10007372`,
+`FUN_004129b0`) are the ones the port has been checking against.
 
-**Recommended priority for the next agent:**
+**Native decoders (`shogo-assets`).** DTX, ABC, and DAT v56. ABC character
+geometry is piece-local; the decoder chains the `static_model` bind pose so a
+trooper or mech is one standing mesh. DAT reads the root WorldBSP (the same
+layout as `tools/ltdat.py`) plus `GameStartPoint` and any object that has a
+`Pos` and either a class containing `_` or a `.abc` filename (`level_actors`).
 
-1. **Add a native `dat` decoder to `shogo-assets`** (port `tools/ltdat.py`) and
-   load original `.DAT` in `shogo-viewer` the same way ABC already loads.
-   Texture worlds via `shogo-assets::dtx` + per-surface texture index →
-   `StandardMaterial.base_color_texture`. ABC models still have no .dtx refs
-   (`mod3_Object.dll` later).
+**Bevy runtime (`shogo-viewer`).** Loads those files directly. Default mission
+is `WORLDS/01_AMBUSH.DAT` ("The Ambush"): menu PCX, bumper PCX, player at
+`start1`, the DAT's Cronian/Fallen hostiles and UCA escorts, trucks and
+airborne dropships/APCs, two weapons, on-foot/MCA, sphere collision, nav grid,
+one continue file. Worlds with no character classes (the multi map) still use
+the wave sandbox. Music is retail WAV through `paplay` because `bevy_audio`
+needs ALSA headers this machine does not have.
 
-2. **Begin the gameplay rewrite.** Physics (PBlocks `FUN_004129b0`), AI,
-   MCA/on-foot, weapons from `Client.exe` + `mod2_CShellRef.dll` /
-   `mod3_Object.dll` / `server.dll`. Spawns/lights/doors/triggers are extracted.
+**Not ported.** Trigger, objective, transmission, and door objects are parsed
+only as far as the Python object walk. AI keys and patrols are unused; hostiles
+use a chase sandbox and UCA units simply do not attack. Physics is not the
+PBlock octree. Campaign missions after Ambush are not wired. Extra WorldModels
+and the named section directory are still future work.
 
-3. Optional: extra WorldModels after the root BSP; named section directory;
-   class-registration field names; Wine reference play.
-
-**Environment reminders:** Rust at `~/.cargo` (`source ~/.cargo/env`); Bevy 0.20
-built with a restricted feature set (X11 only, NO audio/wayland) to avoid missing
-system `-dev` headers — see `rust/Cargo.toml` rationale. Viewer run:
-`cd rust && SHOGO_MODEL=../extracted/SHOGO/MODELS/CHARACTERS/GABRIEL.ABC WGPU_BACKEND=vulkan cargo run --release -p shogo-viewer`.
+**Run:** `cd rust && WGPU_BACKEND=vulkan cargo run -p shogo-viewer`.
