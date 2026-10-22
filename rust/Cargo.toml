@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/shogo-assets", "crates/shogo-viewer", "crates/shogo-game"]
+members = ["crates/shogo-assets", "crates/shogo-viewer"]
 
 [workspace.package]
 version = "0.1.0"

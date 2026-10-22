@@ -29,7 +29,7 @@ const MARKSMAN_SCALE: f32 = 0.001;
 const MIN_SPAWN: f32 = 560.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EnemyKind {
+pub(crate) enum EnemyKind {
     Trooper = 0,
     Shock = 1,
     Andra5 = 2,
@@ -176,7 +176,7 @@ impl EnemyKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AiState {
+pub(crate) enum AiState {
     Idle,
     Patrol,
     Chase,
@@ -186,23 +186,23 @@ enum AiState {
 
 #[derive(Component)]
 pub(crate) struct Enemy {
-    kind: EnemyKind,
+    pub(crate) kind: EnemyKind,
     /// UCA units in a campaign mission stay with the player.
-    ally: bool,
-    health: f32,
-    fire_cd: f32,
-    alive: bool,
-    state: AiState,
-    patrol: [Vec3; 2],
-    patrol_i: u8,
-    idle: f32,
-    lost: f32,
-    last_seen: Vec3,
-    path: Vec<Vec3>,
-    path_cd: f32,
-    yaw: f32,
-    dead_t: f32,
-    fall_v: f32,
+    pub(crate) ally: bool,
+    pub(crate) health: f32,
+    pub(crate) fire_cd: f32,
+    pub(crate) alive: bool,
+    pub(crate) state: AiState,
+    pub(crate) patrol: [Vec3; 2],
+    pub(crate) patrol_i: u8,
+    pub(crate) idle: f32,
+    pub(crate) lost: f32,
+    pub(crate) last_seen: Vec3,
+    pub(crate) path: Vec<Vec3>,
+    pub(crate) path_cd: f32,
+    pub(crate) yaw: f32,
+    pub(crate) dead_t: f32,
+    pub(crate) fall_v: f32,
 }
 
 #[derive(Component)]

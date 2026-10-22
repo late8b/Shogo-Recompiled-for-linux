@@ -4230,15 +4230,6 @@ name = "shogo-assets"
 version = "0.1.0"
 
 [[package]]
-name = "shogo-game"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "libc",
- "shogo-assets",
-]
-
-[[package]]
 name = "shogo-viewer"
 version = "0.1.0"
 dependencies = [

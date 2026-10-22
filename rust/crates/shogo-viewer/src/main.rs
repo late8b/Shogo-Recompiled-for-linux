@@ -740,6 +740,7 @@ fn player_move(
     actions: Res<input::Actions>,
     collide: Option<Res<WorldCollide>>,
     mut players: Query<(&mut Player, &mut Transform, &mut Projection)>,
+    enemies: Query<(&combat::Enemy, &Transform), Without<Player>>,
 ) {
     let Some(collide) = collide else {
         return;
@@ -778,6 +779,51 @@ fn player_move(
         let look_scale = 1.0 - 0.45 * player.ads;
         player.yaw -= actions.look.x * look_scale;
         player.pitch = (player.pitch + actions.look.y * look_scale).clamp(-1.45, 1.45);
+
+        // Modern console aim-assist / auto-lock snapping when aiming (right click / L2)
+        if actions.aim && player.health > 0.0 {
+            let player_pos = tf.translation;
+            let fwd = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0) * -Vec3::Z;
+            let mut best_angle = 0.35; // ~20 degrees threshold
+            let mut best_target_dir = None;
+
+            for (enemy, etf) in &enemies {
+                if !enemy.alive || enemy.ally {
+                    continue;
+                }
+                let to_enemy = etf.translation - player_pos;
+                let dist = to_enemy.length();
+                if dist < 10.0 || dist > 3_000.0 {
+                    continue;
+                }
+                let dir = to_enemy / dist;
+                let dot = fwd.dot(dir);
+                if dot > 0.75 { // in front
+                    let angle = 1.0 - dot;
+                    if angle < best_angle {
+                        // check line of sight
+                        let wall_dist = collide.0.raycast(player_pos, dir, dist).unwrap_or(dist);
+                        if wall_dist >= dist - 20.0 {
+                            best_angle = angle;
+                            best_target_dir = Some(dir);
+                        }
+                    }
+                }
+            }
+
+            if let Some(target_dir) = best_target_dir {
+                let target_yaw = (-target_dir.x).atan2(-target_dir.z);
+                let target_pitch = target_dir.y.asin().clamp(-1.45, 1.45);
+                let snap_rate = dt * 12.0; // snappy console snap
+                // Smoothly slerp yaw/pitch toward target
+                let mut dyaw = target_yaw - player.yaw;
+                while dyaw > PI { dyaw -= 2.0 * PI; }
+                while dyaw < -PI { dyaw += 2.0 * PI; }
+                player.yaw += dyaw * snap_rate.min(1.0);
+                player.pitch += (target_pitch - player.pitch) * snap_rate.min(1.0);
+            }
+        }
+
         tf.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0);
 
         let fwd = tf.forward();
