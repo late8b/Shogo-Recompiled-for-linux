@@ -495,6 +495,284 @@ pub fn level_actors(data: &[u8]) -> Result<Vec<LevelActor>, DatError> {
     Ok(out)
 }
 
+/// One authored message, `TargetNameN` / `MessageNameN`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissionMessage {
+    pub target: String,
+    pub body: String,
+}
+
+/// Trigger, exit, objective, or transmission. Positions are LithTech space.
+#[derive(Clone, Debug)]
+pub struct MissionNode {
+    pub class: NodeClass,
+    pub name: String,
+    pub pos: [f32; 3],
+    pub dims: [f32; 3],
+    pub send_delay: f32,
+    pub touch: bool,
+    pub player: bool,
+    pub ai: bool,
+    pub ai_name: String,
+    pub locked: bool,
+    pub messages: Vec<MissionMessage>,
+    pub destination: String,
+    pub start_name: String,
+    pub add_objectives: String,
+    pub remove_objectives: String,
+    pub complete_objectives: String,
+    /// `TransmissionTrigger` string table id. `0` when the node has none.
+    pub string_id: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeClass {
+    Trigger,
+    Exit,
+    Objective,
+    Transmission,
+}
+
+/// `AIKey` marker. `FollowPath b` walks `b0`, `b1`, `b2`, …
+#[derive(Clone, Debug)]
+pub struct Marker {
+    pub name: String,
+    pub pos: [f32; 3],
+}
+
+/// `Key` on a keyframer path. `time` is seconds from the previous key.
+#[derive(Clone, Debug)]
+pub struct MotionKey {
+    pub name: String,
+    pub pos: [f32; 3],
+    pub time: f32,
+    pub target: String,
+    pub message: String,
+}
+
+/// `KeyFramer`. `On` moves `object` along keys named `{base}0`, `{base}1`, …
+#[derive(Clone, Debug)]
+pub struct Framer {
+    pub name: String,
+    pub object: String,
+    pub base: String,
+}
+
+/// A door brush. Breakable shells have hit points. Sliding doors have a move.
+///
+/// `state_flags` is the retail float bitfield: 1 touch-open, 2 start open,
+/// 4 close again after `open_wait`. `waveform` is 0 linear, 1 sine, 2 slow-off,
+/// 3 slow-on.
+#[derive(Clone, Debug)]
+pub struct Door {
+    pub name: String,
+    pub pos: [f32; 3],
+    pub hit_points: f32,
+    pub move_dist: f32,
+    pub move_dir: [f32; 3],
+    pub speed: f32,
+    pub move_delay: f32,
+    pub open_wait: f32,
+    pub close_wait: f32,
+    pub trigger_dims: [f32; 3],
+    pub waveform: u8,
+    pub state_flags: u32,
+}
+
+/// The mission objects the viewer can run without the retail script VM.
+#[derive(Clone, Debug, Default)]
+pub struct MissionData {
+    pub nodes: Vec<MissionNode>,
+    pub markers: Vec<Marker>,
+    pub keys: Vec<MotionKey>,
+    pub framers: Vec<Framer>,
+    pub doors: Vec<Door>,
+}
+
+/// Read triggers, AI keys, keyframers, and breakable doors from the object list.
+pub fn read_mission(data: &[u8]) -> Result<MissionData, DatError> {
+    let raw = raw_objects(data)?;
+    let mut out = MissionData::default();
+    for (class, props) in raw {
+        let name = prop_str(&props, "Name");
+        let pos = prop_vec(&props, "Pos");
+        match class.as_str() {
+            "AIKey" => out.markers.push(Marker { name, pos }),
+            "Key" => out.keys.push(MotionKey {
+                name,
+                pos,
+                time: prop_f32(&props, "TimeStamp"),
+                target: prop_str(&props, "MessageTarget"),
+                message: prop_str(&props, "MessageName"),
+            }),
+            "KeyFramer" => out.framers.push(Framer {
+                name,
+                object: prop_str(&props, "ObjectName"),
+                base: prop_str(&props, "BaseKeyName"),
+            }),
+            "Trigger" | "ExitTrigger" | "ObjectiveTrigger" | "TransmissionTrigger" => {
+                let mut messages = Vec::new();
+                for i in 1..=10 {
+                    let target = prop_str(&props, &format!("TargetName{i}"));
+                    let body = prop_str(&props, &format!("MessageName{i}"));
+                    if target.is_empty() {
+                        continue;
+                    }
+                    messages.push(MissionMessage { target, body });
+                }
+                let class = match class.as_str() {
+                    "ExitTrigger" => NodeClass::Exit,
+                    "ObjectiveTrigger" => NodeClass::Objective,
+                    "TransmissionTrigger" => NodeClass::Transmission,
+                    _ => NodeClass::Trigger,
+                };
+                out.nodes.push(MissionNode {
+                    class,
+                    name,
+                    pos,
+                    dims: prop_vec(&props, "Dims"),
+                    send_delay: prop_f32(&props, "SendDelay"),
+                    touch: prop_flag(&props, "TriggerTouch"),
+                    player: prop_flag(&props, "PlayerTriggerable"),
+                    ai: prop_flag(&props, "AITriggerable"),
+                    ai_name: prop_str(&props, "AITriggerName"),
+                    locked: prop_flag(&props, "Locked"),
+                    messages,
+                    destination: prop_str(&props, "DestinationWorld"),
+                    start_name: prop_str(&props, "StartPointName"),
+                    add_objectives: prop_str(&props, "AddObjectives"),
+                    remove_objectives: prop_str(&props, "RemoveObjectives"),
+                    complete_objectives: prop_str(&props, "CompleteObjectives"),
+                    string_id: prop_f32(&props, "StringID") as i32,
+                });
+            }
+            "Door" | "DestructableDoor" => {
+                let hit_points = prop_f32(&props, "HitPoints");
+                let move_dist = prop_f32(&props, "MoveDist");
+                // Sky shells are doors with neither hit points nor a slide.
+                if hit_points <= 0.0 && move_dist.abs() < 1.0 {
+                    continue;
+                }
+                out.doors.push(Door {
+                    name,
+                    pos,
+                    hit_points,
+                    move_dist,
+                    move_dir: prop_vec(&props, "MoveDir"),
+                    speed: prop_f32(&props, "Speed"),
+                    move_delay: prop_f32(&props, "MoveDelay"),
+                    open_wait: prop_f32(&props, "OpenWaitTime"),
+                    close_wait: prop_f32(&props, "CloseWaitTime"),
+                    trigger_dims: prop_vec(&props, "TriggerDims"),
+                    waveform: prop_f32(&props, "Waveform").round().max(0.0) as u8,
+                    state_flags: prop_f32(&props, "StateFlags").round().max(0.0) as u32,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+enum ObjProp {
+    Vec([f32; 3]),
+    Num(f32),
+    Byte(u8),
+    Str(String),
+}
+
+fn raw_objects(data: &[u8]) -> Result<Vec<(String, Vec<(String, ObjProp)>)>, DatError> {
+    if data.len() < 8 {
+        return Err(DatError::Truncated);
+    }
+    let mut r = R {
+        d: data,
+        p: u32_at(data, 4) as usize,
+    };
+    let nobj = r.u32()? as usize;
+    if nobj > 200_000 {
+        return Err(DatError::BadHeader("object count"));
+    }
+    let mut out = Vec::new();
+    for _ in 0..nobj {
+        let objsz = r.u16()? as usize;
+        let ds = r.p;
+        let nlen = r.u16()? as usize;
+        let class = String::from_utf8_lossy(r.take(nlen)?).into_owned();
+        let nprops = r.u32()? as usize;
+        let mut props = Vec::with_capacity(nprops);
+        for _ in 0..nprops {
+            let pl = r.u16()? as usize;
+            let pname = String::from_utf8_lossy(r.take(pl)?).into_owned();
+            let ptype = r.u8()?;
+            r.take(4)?;
+            let vlen = r.u16()? as usize;
+            let val = r.take(vlen)?;
+            let prop = if (ptype == 1 || ptype == 2) && val.len() >= 12 {
+                ObjProp::Vec([
+                    f32::from_le_bytes(val[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(val[4..8].try_into().unwrap()),
+                    f32::from_le_bytes(val[8..12].try_into().unwrap()),
+                ])
+            } else if (ptype == 3 || ptype == 6) && val.len() >= 4 {
+                // Type 6 is the same f32 as a float. Door flags and waveforms use it.
+                ObjProp::Num(f32::from_le_bytes(val[0..4].try_into().unwrap()))
+            } else if ptype == 5 && !val.is_empty() {
+                ObjProp::Byte(val[0])
+            } else if let Some(s) = lt_string(val) {
+                ObjProp::Str(s)
+            } else {
+                ObjProp::Str(String::new())
+            };
+            props.push((pname, prop));
+        }
+        if r.p > ds + objsz {
+            return Err(DatError::BadHeader("object overrun"));
+        }
+        r.p = ds + objsz;
+        out.push((class, props));
+    }
+    Ok(out)
+}
+
+fn prop_str(props: &[(String, ObjProp)], key: &str) -> String {
+    props
+        .iter()
+        .find(|(name, _)| name == key)
+        .and_then(|(_, prop)| match prop {
+            ObjProp::Str(s) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn prop_f32(props: &[(String, ObjProp)], key: &str) -> f32 {
+    props
+        .iter()
+        .find(|(name, _)| name == key)
+        .and_then(|(_, prop)| match prop {
+            ObjProp::Num(n) => Some(*n),
+            ObjProp::Byte(b) => Some(*b as f32),
+            _ => None,
+        })
+        .unwrap_or(0.0)
+}
+
+fn prop_flag(props: &[(String, ObjProp)], key: &str) -> bool {
+    prop_f32(props, key) != 0.0
+}
+
+fn prop_vec(props: &[(String, ObjProp)], key: &str) -> [f32; 3] {
+    props
+        .iter()
+        .find(|(name, _)| name == key)
+        .and_then(|(_, prop)| match prop {
+            ObjProp::Vec(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or([0.0, 0.0, 0.0])
+}
+
 /// Title from the world header, e.g. `The Ambush`.
 pub fn world_title(data: &[u8]) -> Option<String> {
     if data.len() < 16 {
@@ -571,5 +849,51 @@ mod tests {
         assert!(actors
             .iter()
             .any(|a| a.model.to_ascii_lowercase().ends_with("truck.abc")));
+        let mission = read_mission(&data).unwrap();
+        let exit = mission
+            .nodes
+            .iter()
+            .find(|n| n.class == NodeClass::Exit && n.name == "outtahere")
+            .expect("exit");
+        assert!(exit.locked);
+        assert_eq!(exit.destination, "02_Quarters");
+        assert_eq!(exit.start_name, "start1");
+        assert!(mission.markers.iter().any(|m| m.name == "b0"));
+        assert!(mission.markers.iter().any(|m| m.name == "b4"));
+        let barb = mission.doors.iter().find(|d| d.name == "barb1").expect("barb1");
+        assert_eq!(barb.hit_points, 100.0);
+        assert!(mission.doors.iter().all(|d| d.hit_points > 0.0));
+        assert!(mission.doors.iter().all(|d| d.move_dist.abs() < 1.0));
+        assert!(mission.framers.iter().any(|f| f.name == "firstdrop" && f.object == "drop1"));
+        let start = mission
+            .nodes
+            .iter()
+            .find(|n| n.name == "start")
+            .expect("start");
+        assert!(start.messages.iter().any(|m| m.target == "trans1" && m.body == "Trigger"));
+    }
+
+    #[test]
+    fn quarters_lift_is_a_sliding_door() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../extracted/SHOGO/WORLDS/02_QUARTERS.DAT");
+        if !path.exists() {
+            return;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let mission = read_mission(&data).unwrap();
+        let lift = mission
+            .doors
+            .iter()
+            .find(|d| d.name == "mainlift")
+            .expect("mainlift");
+        assert!((lift.move_dist - 640.0).abs() < 0.1);
+        assert!((lift.speed - 300.0).abs() < 0.1);
+        assert_eq!(lift.move_dir, [0.0, 1.0, 0.0]);
+        assert_eq!(lift.state_flags & 4, 4);
+        assert_eq!(lift.waveform, 0);
+        let door = mission.doors.iter().find(|d| d.name == "door2").expect("door2");
+        assert!((door.open_wait - 3.0).abs() < 0.1);
+        assert_eq!(door.state_flags & 1, 1);
     }
 }

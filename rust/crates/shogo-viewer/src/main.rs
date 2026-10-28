@@ -28,6 +28,7 @@ mod arena;
 mod collide;
 mod combat;
 mod front;
+mod script;
 mod input;
 mod nav;
 mod pad;
@@ -72,6 +73,7 @@ fn main() {
             front::apply_launch,
             arena::assemble,
             combat::spawn_fight,
+            script::place,
             front::mission_started,
         ).chain())
         .add_systems(Update, input::gather)
@@ -83,10 +85,14 @@ fn main() {
                 follow_sky,
                 combat::weapons,
                 combat::bolts,
+                script::drive,
                 combat::waves,
+                script::touch_volumes,
+                script::doors,
                 combat::enemies,
                 combat::muzzle_flashes,
                 combat::hud,
+                script::readout,
             )
                 .chain()
                 .run_if(front::sim_runs),
@@ -741,6 +747,8 @@ fn player_move(
     collide: Option<Res<WorldCollide>>,
     mut players: Query<(&mut Player, &mut Transform, &mut Projection)>,
     enemies: Query<(&combat::Enemy, &Transform), Without<Player>>,
+    doors: Query<(&script::Barricade, &Transform), Without<Player>>,
+    slides: Query<(&script::SlidingDoor, &Transform), Without<Player>>,
 ) {
     let Some(collide) = collide else {
         return;
@@ -866,6 +874,18 @@ fn player_move(
         }
         let next = tf.translation + player.vel * dt;
         let (mut center, mut grounded) = collide.0.depenetrate(next, player.radius);
+        for (door, dtf) in &doors {
+            if door.hp <= 0.0 {
+                continue;
+            }
+            center = script::push_sphere(center, player.radius, dtf.translation, door.half);
+        }
+        for (door, dtf) in &slides {
+            if door.along > 0.85 && door.phase != script::DoorPhase::Closing {
+                continue;
+            }
+            center = script::push_sphere(center, player.radius, dtf.translation, door.half);
+        }
         if grounded && player.vel.y < 0.0 {
             player.vel.y = 0.0;
         }

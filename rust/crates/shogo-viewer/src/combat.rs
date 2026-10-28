@@ -203,6 +203,14 @@ pub(crate) struct Enemy {
     pub(crate) yaw: f32,
     pub(crate) dead_t: f32,
     pub(crate) fall_v: f32,
+    /// Object name from the DAT, used by `FollowPath` and `Destroy`.
+    pub(crate) label: String,
+    /// Authored waypoints. Empty until a script order arrives.
+    pub(crate) route: Vec<Vec3>,
+    pub(crate) route_i: u16,
+    pub(crate) run: bool,
+    /// Placed by the mission, so they wait on the script instead of patrolling.
+    pub(crate) authored: bool,
 }
 
 #[derive(Component)]
@@ -664,6 +672,7 @@ fn spawn_enemy(commands: &mut Commands, roster: &Roster, kind: EnemyKind, pos: V
         roster.mesh[i].clone(),
         roster.mat[i].clone(),
         kind.def().name,
+        false,
     );
 }
 
@@ -676,6 +685,7 @@ fn spawn_unit(
     mesh: Handle<Mesh>,
     mat: Handle<StandardMaterial>,
     label: &str,
+    authored: bool,
 ) {
     let def = kind.def();
     let to_player = player - pos;
@@ -702,6 +712,11 @@ fn spawn_unit(
                 yaw,
                 dead_t: 0.0,
                 fall_v: 0.0,
+                label: label.to_string(),
+                route: Vec::new(),
+                route_i: 0,
+                run: false,
+                authored,
             },
             Visibility::Visible,
             Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
@@ -764,7 +779,17 @@ fn place_mission(
             });
             let authored = crate::world_pos(actor.pos);
             let pos = stand_on(collide, authored.x, authored.z, authored.y, kind.def()).unwrap_or(authored);
-            spawn_unit(commands, kind, ally, pos, player, mesh.clone(), mat.clone(), &actor.name);
+            spawn_unit(
+                commands,
+                kind,
+                ally,
+                pos,
+                player,
+                mesh.clone(),
+                mat.clone(),
+                &actor.name,
+                true,
+            );
             cast.push(CastMember {
                 kind,
                 pos,
@@ -807,6 +832,7 @@ fn place_mission(
                 .map(|fy| Vec3::new(authored.x, fy, authored.z))
                 .unwrap_or(authored);
             commands.spawn((
+                crate::script::ScriptProp(actor.name.clone()),
                 Mesh3d(mesh),
                 MeshMaterial3d(mat),
                 Transform::from_translation(pos),
@@ -870,6 +896,7 @@ pub(crate) fn weapons(
     mut players: Query<(Entity, &mut Player, &mut Transform), Without<Enemy>>,
     mut guns: Query<(&ViewGun, &mut Visibility), Without<Enemy>>,
     mut enemies: Query<(Entity, &mut Enemy, &Transform), (Without<Player>, Without<ViewGun>)>,
+    mut doors: Query<(Entity, &mut crate::script::Barricade, &Transform), (Without<Enemy>, Without<Player>)>,
 ) {
     let (Some(collide), Some(flashes)) = (collide.as_ref(), flashes.as_ref()) else {
         return;
@@ -986,7 +1013,26 @@ pub(crate) fn weapons(
                 }
             }
         }
-        if let Some(entity) = best {
+        let mut door_hit: Option<Entity> = None;
+        for (entity, door, dtf) in &doors {
+            if door.hp <= 0.0 {
+                continue;
+            }
+            if let Some(t) = crate::script::ray_aabb(origin, dir, dtf.translation, door.half) {
+                if t < best_t {
+                    best_t = t;
+                    best = None;
+                    door_hit = Some(entity);
+                }
+            }
+        }
+        if let Some(entity) = door_hit {
+            if let Ok((_, mut door, _)) = doors.get_mut(entity) {
+                if crate::script::harm(&mut door, damage) {
+                    commands.entity(entity).despawn();
+                }
+            }
+        } else if let Some(entity) = best {
             if let Ok((_, mut enemy, _)) = enemies.get_mut(entity) {
                 kill_or_hurt(&mut enemy, damage);
             }
@@ -1015,6 +1061,7 @@ pub(crate) fn bolts(
     flashes: Option<Res<MuzzleBank>>,
     mut bolts: Query<(Entity, &mut Bolt, &mut Transform)>,
     mut enemies: Query<(Entity, &mut Enemy, &Transform), Without<Bolt>>,
+    mut doors: Query<(Entity, &mut crate::script::Barricade, &Transform), Without<Bolt>>,
 ) {
     let (Some(collide), Some(flashes)) = (collide, flashes) else {
         return;
@@ -1042,6 +1089,29 @@ pub(crate) fn bolts(
                     best = Some(enemy_ent);
                 }
             }
+        }
+        let mut door_hit: Option<Entity> = None;
+        for (door_ent, door, dtf) in &doors {
+            if door.hp <= 0.0 {
+                continue;
+            }
+            if let Some(t) = crate::script::ray_aabb(origin, bolt.dir, dtf.translation, door.half) {
+                if t < best_t {
+                    best_t = t;
+                    best = None;
+                    door_hit = Some(door_ent);
+                }
+            }
+        }
+        if let Some(hit) = door_hit {
+            if let Ok((_, mut door, _)) = doors.get_mut(hit) {
+                if crate::script::harm(&mut door, bolt.damage) {
+                    commands.entity(hit).despawn();
+                }
+            }
+            spawn_world_flash(&mut commands, &flashes, origin + bolt.dir * best_t, 28.0, 0.12);
+            commands.entity(entity).despawn();
+            continue;
         }
         if let Some(hit) = best {
             if let Ok((_, mut enemy, _)) = enemies.get_mut(hit) {
@@ -1112,6 +1182,7 @@ fn revive(
                 member.mesh.clone(),
                 member.mat.clone(),
                 &member.label,
+                true,
             );
         }
     }
@@ -1187,6 +1258,43 @@ pub(crate) fn enemies(
         if see {
             enemy.last_seen = player_pos;
             enemy.lost = 0.0;
+        }
+
+        if enemy.authored {
+            let following = (enemy.route_i as usize) < enemy.route.len();
+            let hold = enemy.ally || (!see && !matches!(enemy.state, AiState::Chase | AiState::Attack));
+            if hold {
+                if following {
+                    let goal = enemy.route[enemy.route_i as usize];
+                    let steer = Vec3::new(goal.x - pos.x, 0.0, goal.z - pos.z);
+                    if steer.length() < 80.0 {
+                        enemy.route_i = enemy.route_i.saturating_add(1);
+                    } else {
+                        let dir_g = steer.normalize_or_zero();
+                        enemy.yaw = (-dir_g.x).atan2(-dir_g.z);
+                        tf.rotation = Quat::from_rotation_y(enemy.yaw);
+                        let speed = if enemy.run {
+                            def.move_speed
+                        } else {
+                            def.move_speed * 0.45
+                        };
+                        pos = step_on(
+                            &collide.0,
+                            pos,
+                            dir_g,
+                            speed,
+                            def.body_radius,
+                            def.height * 0.5,
+                            i,
+                            &bodies,
+                            dt,
+                        );
+                    }
+                }
+                tf.translation = pos;
+                bodies[i].0 = pos;
+                continue;
+            }
         }
 
         enemy.state = match enemy.state {
