@@ -17,11 +17,12 @@ asset-format specs, recovered C++ class names).
 | DTX textures → PNG | **Done** — 3,641 / 3,675 decoded (34 are zero-dim placeholders) |
 | ABC models → glTF | **Done** — 538 / 538 models, exact byte consumption |
 | Rust asset decoders | **Done** — `shogo-assets` (DTX, ABC bind pose, DAT v56), unit-tested |
-| Bevy runtime | **Mission 1 playable** — original DAT/ABC/DTX/PCX/WAV, menu, bumper, combat, save |
-| DAT world objects/properties | **Done** — grammar verified; campaign cast is placed from the object list |
+| Bevy runtime | **Mission 1 playable** — original DAT/ABC/DTX/PCX/WAV, menu, bumper, combat, save, triggers, doors, objectives |
+| DAT world objects/properties | **Done** — grammar verified; cast, triggers, keys, and doors come from the object list |
 | DAT world geometry | **Done** — v56 WorldBSP on all 60 worlds; native decoder plus `ltdat.py` / `dat2glb.py` |
 | Ghidra decompilation | **Reference only** — 6,455 functions in `decompiled/`; not a rebuilt executable |
-| Full campaign / original AI | Not started — triggers, objectives, doors, and scripted patrols are still in the dump |
+| Mission script | **Slice** — trigger volumes, objectives, patrol keys, keyframers, breakable doors, sliding doors |
+| Full campaign | Exit names the next world and does not load it. Door panels are cuboids. Retail physics is still in the dump |
 
 ## Repository layout
 
@@ -43,7 +44,7 @@ converted/                ready-to-use assets
   worlds/                 .glb (mirrors the DAT tree)
 rust/                     Cargo workspace
   crates/shogo-assets/    native DTX, ABC, and DAT decoders (no Bevy dependency)
-  crates/shogo-viewer/    Bevy runtime: menu, Ambush, combat, save
+  crates/shogo-viewer/    Bevy runtime: menu, Ambush, combat, mission script, save
 embedded/                 the 4 game-logic DLLs extracted from SHOGO.REZ
 decompiled/               Ghidra decompiler output (6,455 functions)
 ghidra/                   headless decompile script
@@ -136,8 +137,10 @@ Full detail in `docs/FINDINGS.md`.
   figure stands in one mesh.
 - **SPR** — just a path pointer to a DTX.
 - **DAT** — DEdit world (v56): object/entity list (spawns, lights, triggers
-  with Pos/Rotation), then WorldBSP (points, surfaces with OPQ UVs, polygons).
-  `tools/ltdat.py`, `tools/dat2glb.py`.
+  with Pos/Rotation, doors with MoveDist/MoveDir/StateFlags), then WorldBSP
+  (points, surfaces with OPQ UVs, polygons). `shogo-assets` `read_mission`
+  reads triggers, AI keys, keyframers, and doors. `tools/ltdat.py`,
+  `tools/dat2glb.py`.
 
 ## Goals / roadmap
 
@@ -148,8 +151,11 @@ Full detail in `docs/FINDINGS.md`.
    four game DLLs to `decompiled/` (6,455 functions). That tree is the
    reference. It is not cleaned up and it does not build.
 4. **Gameplay rewrite** — mission 1 is playable (menu, bumper, authored cast,
-   two weapons, on-foot/MCA, one continue file). Triggers, objectives, doors,
-   transmissions, patrol keys, and the retail physics octree are still only in
+   two weapons, on-foot/MCA, one continue file). The same loop runs the DAT
+   mission graph: trigger volumes, objective ids, `FollowPath` on AI keys,
+   keyframers, breakable barricades, and sliding doors. A finished exit shows
+   the next world name. It does not load that world. Door panels are cuboids.
+   Transmissions show a string id. The retail physics octree is still only in
    the decompiler output.
 
 ## Licensing note
