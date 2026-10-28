@@ -5,12 +5,25 @@
 //! walks `AIKey`s, `On` plays a keyframer, and the locked `ExitTrigger` ends
 //! the mission once something unlocks it.
 
+use bevy::asset::RenderAssetUsages;
+use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::text::FontSize;
-use shogo_assets::dat::{MissionData, MissionMessage, NodeClass};
+use shogo_assets::dat::{DatWorld, MissionData, MissionMessage, NodeClass};
 
 use crate::combat::Enemy;
-use crate::{world_path, world_pos, Player};
+use crate::{
+    find_asset_root, is_sky_portal, resolve_ci, rgba_image, world_path, world_pos, LevelEntity,
+    Player,
+};
+
+/// Fired once when an `ExitTrigger` records a destination. The viewer listens
+/// and swaps the loaded `.DAT` for that world.
+#[derive(Event, Clone, Debug)]
+pub(crate) struct LevelTransitionEvent {
+    pub next_world: String,
+    pub spawn_point: String,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ActorOrder {
@@ -79,6 +92,7 @@ pub(crate) struct Machine {
     line_t: f32,
     exit_world: String,
     exit_start: String,
+    exit_sent: bool,
     finished: bool,
     places: Vec<(String, [f32; 3])>,
     door_orders: Vec<(String, DoorVerb)>,
@@ -142,6 +156,7 @@ impl Machine {
             line_t: 0.0,
             exit_world: String::new(),
             exit_start: String::new(),
+            exit_sent: false,
             finished: false,
             places: Vec::new(),
             door_orders: Vec::new(),
@@ -202,6 +217,16 @@ impl Machine {
     pub(crate) fn finished(&self) -> Option<(&str, &str)> {
         self.finished
             .then_some((self.exit_world.as_str(), self.exit_start.as_str()))
+    }
+
+    /// One destination per exit. `finished` stays readable; this is what the
+    /// level loader consumes so the same exit cannot reload the world every tick.
+    pub(crate) fn take_transition(&mut self) -> Option<(String, String)> {
+        if self.exit_sent || !self.finished {
+            return None;
+        }
+        self.exit_sent = true;
+        Some((self.exit_world.clone(), self.exit_start.clone()))
     }
 
     pub(crate) fn take_door_orders(&mut self) -> Vec<(String, DoorVerb)> {
@@ -572,6 +597,8 @@ pub(crate) struct SlidingDoor {
     pub locked: bool,
     pub half: Vec3,
     pub touch_half: Vec3,
+    /// Authored object position. The brush center in `rest` can sit off this.
+    pub touch: Vec3,
 }
 
 /// One authored trigger, exit, objective, or transmission volume.
@@ -621,50 +648,57 @@ pub(crate) fn place(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let Some(path) = world_path() else {
         return;
     };
-    let Ok(data) = std::fs::read(path) else {
+    let Ok(data) = std::fs::read(&path) else {
         return;
     };
+    commands.insert_resource(crate::door_audio::DoorCues::from_dat(&data));
     let Ok(mission) = shogo_assets::dat::read_mission(&data) else {
         return;
     };
     if mission.nodes.is_empty() && mission.doors.is_empty() {
         return;
     }
-    let mesh = meshes.add(Cuboid::new(DOOR_HALF.x * 2.0, DOOR_HALF.y * 2.0, DOOR_HALF.z * 2.0));
-    let mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.35, 0.32, 0.28),
-        unlit: true,
-        ..default()
-    });
-    let slab = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.45, 0.5, 0.55),
-        unlit: true,
-        ..default()
-    });
+    let models = shogo_assets::dat::world_models(&data).unwrap_or_default();
+    let asset_root = find_asset_root(std::path::Path::new(&path));
     let mut sliding = 0u32;
     let mut barricades = 0u32;
+    let mut brushed = 0u32;
     for door in &mission.doors {
         let pos = world_pos(door.pos);
+        let brush = find_model(&models, &door.name).and_then(|model| {
+            door_brush(model, asset_root.as_deref(), images.as_mut())
+        });
         if door.hit_points > 0.0 && door.move_dist.abs() < 1.0 {
             barricades += 1;
-            commands.spawn((
+            let (center, half) = brush
+                .as_ref()
+                .map(|b| (b.center, b.half))
+                .unwrap_or((pos, DOOR_HALF));
+            let mut entity = commands.spawn((
+                LevelEntity,
                 Barricade {
                     hp: door.hit_points,
-                    half: DOOR_HALF,
+                    half,
                 },
-                Mesh3d(mesh.clone()),
-                MeshMaterial3d(mat.clone()),
-                Transform::from_translation(pos),
+                Visibility::default(),
+                Transform::from_translation(center),
             ));
-        }
-        if door.move_dist.abs() >= 1.0 {
+            if let Some(brush) = brush {
+                brushed += 1;
+                attach_brush(&mut entity, &mut meshes, &mut materials, brush);
+            }
+        } else if door.move_dist.abs() >= 1.0 {
             sliding += 1;
             let travel = world_pos(door.move_dir) * door.move_dist;
-            let half = panel_half(travel);
+            let (center, half) = brush
+                .as_ref()
+                .map(|b| (b.center, b.half))
+                .unwrap_or((pos, panel_half(travel)));
             let touch_half = trigger_half(door.trigger_dims, half);
             let starts_open = door.state_flags & 2 != 0;
             let along = if starts_open { 1.0 } else { 0.0 };
@@ -673,10 +707,11 @@ pub(crate) fn place(
             } else {
                 DoorPhase::Closed
             };
-            commands.spawn((
+            let mut entity = commands.spawn((
+                LevelEntity,
                 SlidingDoor {
                     name: door.name.clone(),
-                    rest: pos,
+                    rest: center,
                     travel,
                     speed: if door.speed > 1.0 { door.speed } else { 200.0 },
                     move_delay: door.move_delay.max(0.0),
@@ -690,11 +725,15 @@ pub(crate) fn place(
                     locked: false,
                     half,
                     touch_half,
+                    touch: pos,
                 },
-                Mesh3d(meshes.add(Cuboid::new(half.x * 2.0, half.y * 2.0, half.z * 2.0))),
-                MeshMaterial3d(slab.clone()),
-                Transform::from_translation(pos + travel * wave(door.waveform, along)),
+                Visibility::default(),
+                Transform::from_translation(center + travel * wave(door.waveform, along)),
             ));
+            if let Some(brush) = brush {
+                brushed += 1;
+                attach_brush(&mut entity, &mut meshes, &mut materials, brush);
+            }
         }
     }
     for node in &mission.nodes {
@@ -704,6 +743,7 @@ pub(crate) fn place(
             if node.dims[2] < 1.0 { 16.0 } else { node.dims[2] },
         );
         commands.spawn((
+            LevelEntity,
             TriggerVolume {
                 name: node.name.clone(),
                 half,
@@ -716,10 +756,11 @@ pub(crate) fn place(
         ));
     }
     info!(
-        "world interaction: {sliding} sliding doors, {barricades} barricades, {} trigger volumes",
+        "world interaction: {sliding} sliding doors, {barricades} barricades, {brushed} world-model brushes, {} trigger volumes",
         mission.nodes.len()
     );
     if !mission.nodes.is_empty() {
+        commands.insert_resource(crate::waypoint::Guide::compile(&mission));
         commands.insert_resource(Script {
             machine: Machine::boot(mission),
         });
@@ -797,9 +838,20 @@ pub(crate) fn drive(
             }
         }
     }
+    publish_exit(script, &mut commands);
+}
+
+fn publish_exit(script: &mut Script, commands: &mut Commands) {
+    if let Some((next_world, spawn_point)) = script.machine.take_transition() {
+        commands.trigger(LevelTransitionEvent {
+            next_world,
+            spawn_point,
+        });
+    }
 }
 
 pub(crate) fn readout(
+    dialogue: Res<crate::transmission::Dialogue>,
     script: Option<Res<Script>>,
     mut commands: Commands,
     mut lines: Query<&mut Text, With<MissionReadout>>,
@@ -807,9 +859,10 @@ pub(crate) fn readout(
     let Some(script) = script else {
         return;
     };
-    let line = script.line().to_string();
+    let line = dialogue.line(script.line());
     if lines.is_empty() {
         commands.spawn((
+            LevelEntity,
             MissionReadout,
             Node {
                 position_type: PositionType::Absolute,
@@ -834,15 +887,18 @@ pub(crate) fn readout(
 /// Player sphere against each trigger volume. The script still fires the node;
 /// this records the overlap on the component.
 pub(crate) fn touch_volumes(
+    mut commands: Commands,
     mut script: Option<ResMut<Script>>,
     objectives: Option<ResMut<ObjectiveState>>,
+    guide: Option<Res<crate::waypoint::Guide>>,
     players: Query<(&Player, &Transform)>,
-    mut volumes: Query<(&mut TriggerVolume, &Transform)>,
+    mut volumes: Query<(Entity, &mut TriggerVolume, &Transform)>,
+    mut markers: Query<(Entity, &mut crate::waypoint::MissionMarker)>,
 ) {
     let Some((body, ptf)) = players.single().ok() else {
         return;
     };
-    for (mut volume, tf) in &mut volumes {
+    for (_ent, mut volume, tf) in &mut volumes {
         let was = volume.occupied;
         volume.occupied = sphere_hits(ptf.translation, body.radius, tf.translation, volume.half);
         let armed = volume.player && (volume.touch || volume.class == NodeClass::Exit);
@@ -852,16 +908,24 @@ pub(crate) fn touch_volumes(
             }
         }
     }
-    if let (Some(script), Some(mut objectives)) = (script, objectives) {
-        let (active, done) = script.machine.objectives();
-        objectives.active = active.to_vec();
-        objectives.done = done.to_vec();
+    if let Some(script) = script.as_mut() {
+        if let Some(mut objectives) = objectives {
+            let (active, done) = script.machine.objectives();
+            objectives.active = active.to_vec();
+            objectives.done = done.to_vec();
+            if let Some(guide) = guide.as_deref() {
+                crate::waypoint::retarget(&mut commands, guide, &objectives, &volumes, &mut markers);
+            }
+        }
+        publish_exit(script, &mut commands);
     }
 }
 
 /// Slide doors. A `Trigger` message, or the player in the touch box, starts them.
 pub(crate) fn doors(
     time: Res<Time>,
+    tune: Res<crate::tune::Mixer>,
+    cues: Option<Res<crate::door_audio::DoorCues>>,
     mut script: Option<ResMut<Script>>,
     players: Query<&Transform, With<Player>>,
     mut doors: Query<(&mut SlidingDoor, &mut Transform), Without<Player>>,
@@ -873,6 +937,7 @@ pub(crate) fn doors(
         .unwrap_or_default();
     let player = players.single().ok().map(|tf| tf.translation);
     for (mut door, mut tf) in &mut doors {
+        let was = door.phase;
         for (name, verb) in &orders {
             if !same(&door.name, name) {
                 continue;
@@ -885,8 +950,7 @@ pub(crate) fn doors(
         }
         if door.flags & 1 != 0 {
             if let Some(player) = player {
-                let doorway = door.rest;
-                if !door.locked && sphere_hits(player, 32.0, doorway, door.touch_half) {
+                if !door.locked && sphere_hits(player, 32.0, door.touch, door.touch_half) {
                     ask_open(&mut door);
                 }
             }
@@ -894,6 +958,15 @@ pub(crate) fn doors(
         step_door(&mut door, dt);
         let shaped = wave(door.waveform, door.along);
         tf.translation = door.rest + door.travel * shaped;
+        crate::door_audio::slide(
+            &tune,
+            cues.as_deref(),
+            &door.name,
+            was,
+            door.phase,
+            tf.translation,
+            player,
+        );
     }
 }
 
@@ -967,6 +1040,123 @@ pub(crate) fn wave(kind: u8, t: f32) -> f32 {
         3 => 1.0 - (t * std::f32::consts::FRAC_PI_2).cos(),
         _ => t,
     }
+}
+
+struct DoorBrush {
+    center: Vec3,
+    half: Vec3,
+    parts: Vec<(Mesh, StandardMaterial)>,
+}
+
+fn find_model<'a>(models: &'a [DatWorld], name: &str) -> Option<&'a DatWorld> {
+    models
+        .iter()
+        .find(|model| model.name == name)
+        .or_else(|| models.iter().find(|model| model.name.eq_ignore_ascii_case(name)))
+}
+
+/// WorldModel brush recentered on its point cloud so the entity origin is the
+/// box the collision queries already assume.
+fn door_brush(
+    model: &DatWorld,
+    asset_root: Option<&std::path::Path>,
+    images: &mut Assets<Image>,
+) -> Option<DoorBrush> {
+    if model.groups.is_empty() {
+        return None;
+    }
+    let center = world_pos([
+        (model.min[0] + model.max[0]) * 0.5,
+        (model.min[1] + model.max[1]) * 0.5,
+        (model.min[2] + model.max[2]) * 0.5,
+    ]);
+    let span = world_pos(model.max) - world_pos(model.min);
+    let half = Vec3::new(
+        (span.x.abs() * 0.5).max(2.0),
+        (span.y.abs() * 0.5).max(2.0),
+        (span.z.abs() * 0.5).max(2.0),
+    );
+    let mut parts = Vec::new();
+    for group in &model.groups {
+        let tex_name = model
+            .textures
+            .get(group.texture as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if is_sky_portal(tex_name) {
+            continue;
+        }
+        let decoded = asset_root
+            .and_then(|root| resolve_ci(root, tex_name))
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| shogo_assets::dtx::decode(&bytes).ok());
+        let (tw, th) = decoded
+            .as_ref()
+            .map(|tex| (tex.width as f32, tex.height as f32))
+            .filter(|(w, h)| *w > 0.0 && *h > 0.0)
+            .unwrap_or((64.0, 64.0));
+        let positions: Vec<[f32; 3]> = group
+            .positions
+            .iter()
+            .map(|p| {
+                let g = world_pos(*p) - center;
+                [g.x, g.y, g.z]
+            })
+            .collect();
+        let uvs: Vec<[f32; 2]> = group.uvs.iter().map(|[u, v]| [u / tw, 1.0 - v / th]).collect();
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        mesh.insert_indices(Indices::U32(group.indices.clone()));
+        mesh.compute_area_weighted_normals();
+        let base_color = if decoded.is_some() {
+            Color::WHITE
+        } else {
+            Color::srgb(0.35, 0.35, 0.35)
+        };
+        parts.push((
+            mesh,
+            StandardMaterial {
+                base_color,
+                base_color_texture: decoded.map(|tex| {
+                    images.add(rgba_image(tex.width, tex.height, tex.rgba))
+                }),
+                perceptual_roughness: 1.0,
+                metallic: 0.0,
+                reflectance: 0.0,
+                unlit: false,
+                double_sided: true,
+                cull_mode: None,
+                ..default()
+            },
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(DoorBrush { center, half, parts })
+    }
+}
+
+fn attach_brush(
+    entity: &mut EntityCommands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    brush: DoorBrush,
+) {
+    let handles: Vec<_> = brush
+        .parts
+        .into_iter()
+        .map(|(mesh, material)| (meshes.add(mesh), materials.add(material)))
+        .collect();
+    entity.with_children(|parent| {
+        for (mesh, material) in handles {
+            parent.spawn((Mesh3d(mesh), MeshMaterial3d(material)));
+        }
+    });
 }
 
 fn panel_half(travel: Vec3) -> Vec3 {
@@ -1201,6 +1391,12 @@ mod tests {
         machine.deliver("outtahere", "Unlock");
         machine.tick(0.0, [100.0, 0.0, 0.0], &[]);
         assert_eq!(machine.finished(), Some(("02_Quarters", "start1")));
+        assert_eq!(
+            machine.take_transition(),
+            Some(("02_Quarters".into(), "start1".into()))
+        );
+        assert!(machine.take_transition().is_none());
+        assert_eq!(machine.finished(), Some(("02_Quarters", "start1")));
     }
 
     #[test]
@@ -1304,6 +1500,7 @@ mod tests {
             locked: false,
             half: Vec3::new(56.0, 12.0, 56.0),
             touch_half: Vec3::splat(64.0),
+            touch: Vec3::ZERO,
         };
         ask_open(&mut door);
         assert_eq!(door.phase, DoorPhase::Opening);

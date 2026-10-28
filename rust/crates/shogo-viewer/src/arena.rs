@@ -71,6 +71,7 @@ pub fn assemble(
         let size = max - min;
         let center = (min + max) * 0.5;
         commands.spawn((
+            crate::LevelEntity,
             Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
             MeshMaterial3d(mat.clone()),
             Transform::from_translation(center),

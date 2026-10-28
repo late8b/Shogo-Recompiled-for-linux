@@ -85,7 +85,7 @@ HP, `MoveDist` 0). `02_QUARTERS.DAT` `mainlift` slides 640 along +Y at speed
 | `TriggerVolume` | Player sphere against `Dims`. Rising edge fires the node when it is player-touchable or an exit. AI touch is separate. |
 | `ObjectiveState` | Add / remove / complete id lists. The HUD line is `Objective {id}`. |
 | `Transmission` | Shows `Transmission {StringID}` for 6 seconds. The retail string table is not loaded. |
-| `ExitTrigger` | Locked until `Unlock`. Then the line is `Mission complete. Next: {world}`. `outtahere` names `02_Quarters` / `start1`. The next DAT is not loaded. |
+| `ExitTrigger` | Locked until `Unlock`. Then one `LevelTransitionEvent` fires. `outtahere` names `02_Quarters` / `start1`. |
 | `FollowPath` | Numbered `AIKey`s (`b0`, `b1`, …). Authored allies stay on the path. Hostiles leave it once they see the player. |
 | `KeyFramer` | `On` moves the named prop along `{BaseKeyName}0`, `{BaseKeyName}1`, … |
 | `Barricade` | Breakable door, 72×96×36 cuboid. Shots and the player sphere hit it. |
@@ -99,6 +99,27 @@ A Quarters boot logged 6 sliding doors, 35 barricades, and 82 trigger volumes.
 The panels are steel cuboids sized from the travel axis. They are not the
 WorldModel brushes. Open and close sounds are not played.
 
+## What is DONE — level change
+
+Walking into an unlocked exit unloads the current map and loads the next
+retail `.DAT`. Verified in the window: Ambush `outtahere` lands in the hangar
+of **Calm Before the Storm** (`WORLDS/02_QUARTERS.DAT`) at `start1`
+`(−80, 32, 1088)`.
+
+`script.rs` keeps `finished()` readable for tests and emits the event once
+through `take_transition`. `main.rs` listens with an observer. The handler
+despawns every `LevelEntity` (geometry, sky, cast, props, triggers, doors,
+bolts) and leaves the player, guns, and HUD. Health, ammo, and the current
+weapon carry over. `resolve_next_world` matches the destination stem in the
+same `WORLDS` directory, ignoring case (`02_Quarters` → `02_QUARTERS.DAT`).
+The named `GameStartPoint` sets translation. Its `Rotation` is stored; both
+retail starts checked so far leave that vector empty, so facing is yaw 0.
+Quarters' own exits name `03_MCA_Dock` / `start1` (`03_MCA_DOCK.DAT`). That
+second hop has not been walked.
+
+A new game still boots Ambush. Continue compares the save's mission name to
+the world just loaded, so a save written in Quarters does not resume there.
+
 ## Decompilation state
 
 `decompiled/` is a Ghidra dump of the retail binaries: 6,455 functions,
@@ -108,22 +129,24 @@ rewrite on top of the decoded assets, not a translation of those functions.
 
 Still only in the dump, not in the runtime:
 
-- Loading the next mission when an exit finishes. The machine records the
-  destination and the start point, then stops.
 - Retail door brushes (the named WorldModel section) and open/close sounds.
-- Transmission text from the string table. The HUD shows the numeric id.
+- Transmission text from the string table. The HUD shows `Objective {id}` and
+  `Transmission {StringID}`. Ambush's first objective is `1040`.
 - Retail physics (`FUN_004129b0`, PBlocks).
-- The rest of the campaign loop, inventory, and the original weapon set.
+- Inventory, ammo pickups, and the original weapon set. Ambush has no ammo
+  objects. The rifle starts at 30 in the mag and 90 in the pack. Death
+  refills both. R reloads.
 - Extra WorldModels after the root BSP, and the named section directory.
+- Continue into a world other than the one `load_asset` boots.
 
 ## NEXT ACTION (priority order)
-1. **Load the next world.** When `Machine::finished` is `02_Quarters` /
-   `start1`, swap `SHOGO_WORLD` to `WORLDS/02_QUARTERS.DAT` and respawn there.
-   The script already records that pair. Nothing reads it outside tests.
-2. **Door brushes.** Replace the sliding-door and barricade cuboids with the
+1. **Door brushes.** Replace the sliding-door and barricade cuboids with the
    WorldModel BSP named by each door.
-3. **Transmission copy.** Resolve `StringID` through the retail string table
-   instead of printing the number.
+2. **Transmission copy.** Resolve `StringID` through the retail string table
+   instead of printing the number. The extract has no string table yet.
+3. **Resume the world you saved.** A continue file records the DAT name. The
+   menu boot still always loads Ambush, then applies the save only when the
+   names match.
 4. **Physics closer to LithTech.** PBlocks in the DAT are parsed by `ltdat.py`
    but the viewer still uses a triangle mesh and a sphere.
 
@@ -135,10 +158,10 @@ Still only in the dump, not in the runtime:
 - `rust/crates/shogo-assets/src/{dtx.rs,abc.rs,dat.rs}` — native decoders.
   `dat.rs` `read_mission` reads triggers, keys, keyframers, and doors. Type 6
   properties are floats.
-- `rust/crates/shogo-viewer/src/` — `main.rs` world load, `front.rs` menu /
-  intro / save, `combat.rs` cast and weapons, `script.rs` mission graph and
-  doors, `tune.rs` WAV playback, `collide.rs`, `nav.rs`, `arena.rs`,
-  `input.rs`, `pad.rs`.
+- `rust/crates/shogo-viewer/src/` — `main.rs` world load and level change,
+  `front.rs` menu / intro / save, `combat.rs` cast and weapons, `script.rs`
+  mission graph, doors, and `LevelTransitionEvent`, `tune.rs` WAV playback,
+  `collide.rs`, `nav.rs`, `arena.rs`, `input.rs`, `pad.rs`.
 - `rust/Cargo.toml` — Bevy 0.20 features (X11, UI, no `bevy_audio`, no wayland).
 - `decompiled/Client.exe.c` — world/model loaders (`FUN_00418d80` geometry,
   `FUN_00434ad0` ABC geometry, `FUN_00434270` world UV builder).
@@ -146,6 +169,7 @@ Still only in the dump, not in the runtime:
 - `decompiled/mod3_Object.c` — door property load `FUN_100284c0` and the
   open/close tick `FUN_100287e0`.
 - `extracted/SHOGO/WORLDS/01_AMBUSH.DAT` — the mission the runtime boots.
+  `02_QUARTERS.DAT` is the first exit (Calm Before the Storm).
   `WORLDS/MULTI/MCA_MARITROPA2.DAT` is the wave-sandbox map.
 
 ## Environment

@@ -62,6 +62,33 @@ impl Mixer {
             .stderr(Stdio::null())
             .spawn();
     }
+
+    /// One-shot at a linear gain. `1.0` is paplay's full scale (`65536`).
+    /// Door stingers use this so a far door is quieter than one at the player.
+    /// `paplay` has no world position, so distance is volume only.
+    pub fn sting_at(&self, path: &Path, gain: f32) {
+        if self.tx.is_none() || !path.is_file() {
+            return;
+        }
+        let gain = gain.clamp(0.0, 1.0);
+        if gain < 0.02 {
+            return;
+        }
+        let volume = ((gain * 65536.0).round() as u32).clamp(1, 65536);
+        let Ok(mut child) = Command::new("paplay")
+            .arg(format!("--volume={volume}"))
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 impl Drop for Mixer {

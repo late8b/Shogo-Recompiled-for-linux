@@ -437,6 +437,7 @@ fn leave_mission(
     commands.remove_resource::<crate::combat::MuzzleBank>();
     commands.remove_resource::<crate::combat::ShotRng>();
     commands.remove_resource::<LookGrabbed>();
+    crate::forget_world();
 }
 
 fn clear_front(commands: &mut Commands, roots: &Query<Entity, With<FrontRoot>>) {

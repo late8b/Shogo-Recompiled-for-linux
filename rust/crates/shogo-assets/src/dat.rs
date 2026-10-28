@@ -1,8 +1,9 @@
 //! LithTech 1.0 (DAT v56) world decoder — Shogo / Blood II WorldBSP.
 //!
 //! Layout matches `tools/ltdat.py` and haekb `bspv56.bt`, checked against all
-//! 60 retail Shogo worlds. This reads the root WorldModel only (the bulk of
-//! the level) and expands polygons into per-texture triangle groups.
+//! 60 retail Shogo worlds. The root WorldModel is the level. Named WorldModels
+//! chained after it are doors and other moving brushes. Both expand polygons
+//! into per-texture triangle groups.
 //!
 //! UVs are LithTech OPQ / world mapping, not stored per corner:
 //! `u = P·pos + O.x`, `v = Q·pos + O.y`. Positions stay in LithTech Z-up space.
@@ -217,11 +218,69 @@ pub fn decode(data: &[u8]) -> Result<DatWorld, DatError> {
     let leaf_count = ints[7];
     let node_count = ints[11] as usize;
 
+    read_world_body(
+        &mut r,
+        name,
+        textures,
+        point_count,
+        plane_count,
+        surface_count,
+        portal_count,
+        poly_count,
+        leaf_count,
+        node_count,
+    )
+}
+
+fn counts_sane(
+    point: usize,
+    plane: usize,
+    surface: usize,
+    portal: usize,
+    poly: usize,
+    leaf: u32,
+    node: usize,
+) -> bool {
+    point <= 200_000
+        && plane <= 200_000
+        && surface <= 200_000
+        && portal <= 50_000
+        && poly <= 200_000
+        && leaf <= 200_000
+        && node <= 200_000
+}
+
+/// Brush body shared by the root world and each named WorldModel.
+/// The reader is positioned at the per-poly vertex-count table.
+fn read_world_body(
+    r: &mut R,
+    name: String,
+    textures: Vec<String>,
+    point_count: usize,
+    plane_count: usize,
+    surface_count: usize,
+    portal_count: usize,
+    poly_count: usize,
+    leaf_count: u32,
+    node_count: usize,
+) -> Result<DatWorld, DatError> {
+    if !counts_sane(
+        point_count,
+        plane_count,
+        surface_count,
+        portal_count,
+        poly_count,
+        leaf_count,
+        node_count,
+    ) {
+        return Err(DatError::BadHeader("world model counts"));
+    }
+
     let mut vert_info = Vec::with_capacity(poly_count);
     for _ in 0..poly_count {
         vert_info.push((r.u8()?, r.u8()?));
     }
-    read_leaves(&mut r, leaf_count)?;
+    read_leaves(r, leaf_count)?;
     for _ in 0..plane_count {
         r.take(16)?;
     }
@@ -350,6 +409,98 @@ pub fn decode(data: &[u8]) -> Result<DatWorld, DatError> {
     })
 }
 
+/// Named WorldModels stored after the root BSP. A door's `Name` matches one
+/// of these. Points are already in the same space as the root world.
+pub fn world_models(data: &[u8]) -> Result<Vec<DatWorld>, DatError> {
+    if data.len() < 16 {
+        return Err(DatError::Truncated);
+    }
+    if u32_at(data, 0) != 56 {
+        return Err(DatError::BadHeader("version"));
+    }
+    let geo = u32_at(data, 8) as usize;
+    if geo + 4 > data.len() {
+        return Err(DatError::BadHeader("geometry offset"));
+    }
+    let next_section = u32_at(data, geo) as usize;
+    if next_section + 8 > data.len() {
+        return Ok(Vec::new());
+    }
+    let count = u32_at(data, next_section) as usize;
+    if count == 0 || count > 10_000 {
+        return Ok(Vec::new());
+    }
+    let mut off = next_section + 4;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        if off + 48 > data.len() {
+            break;
+        }
+        let next = u32_at(data, off) as usize;
+        match read_named_model(data, off) {
+            Ok(model) => out.push(model),
+            Err(_) => break,
+        }
+        if next <= off || next + 48 > data.len() {
+            break;
+        }
+        off = next;
+    }
+    Ok(out)
+}
+
+fn read_named_model(data: &[u8], off: usize) -> Result<DatWorld, DatError> {
+    let mut r = R { d: data, p: off };
+    let _next = r.u32()?;
+    for _ in 0..8 {
+        r.u32()?;
+    }
+    let _field = r.u32()?;
+    let name_len = r.u16()? as usize;
+    if name_len == 0 || name_len > 64 {
+        return Err(DatError::BadHeader("world model name"));
+    }
+    let raw = r.take(name_len)?;
+    if !raw.iter().all(|c| (32..127).contains(c)) {
+        return Err(DatError::BadHeader("world model name"));
+    }
+    let name = String::from_utf8_lossy(raw).into_owned();
+    let mut counts = [0u32; 12];
+    for c in &mut counts {
+        *c = r.u32()?;
+    }
+    let _bmin = r.vec3()?;
+    let _bmax = r.vec3()?;
+    let _xlt = r.vec3()?;
+    let table_bytes = r.u32()? as usize;
+    let ntex = r.u32()? as usize;
+    if ntex >= 4000 || table_bytes >= 200_000 {
+        return Err(DatError::BadHeader("world model textures"));
+    }
+    let table_start = r.p;
+    let mut textures = Vec::with_capacity(ntex);
+    for _ in 0..ntex {
+        textures.push(r.cstr(200)?);
+    }
+    if r.p - table_start != table_bytes {
+        return Err(DatError::BadHeader("world model texture table"));
+    }
+    // Counts start at NextPosition: point, plane, surface, portal, poly,
+    // leaf, vert, vis, leaflist, node, extra.
+    read_world_body(
+        &mut r,
+        name,
+        textures,
+        counts[1] as usize,
+        counts[2] as usize,
+        counts[3] as usize,
+        counts[4] as usize,
+        counts[5] as usize,
+        counts[6],
+        counts[10] as usize,
+    )
+}
+
 fn u32_at(d: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
 }
@@ -358,6 +509,8 @@ fn u32_at(d: &[u8], off: usize) -> u32 {
 pub struct StartPoint {
     pub name: String,
     pub pos: [f32; 3],
+    /// Rotation property. Empty in the retail starts we have checked, so this is zero.
+    pub rot: [f32; 3],
 }
 
 /// Read spawn markers. The object grammar is the one verified in `tools/dat_extract_objects.py`.
@@ -381,6 +534,7 @@ pub fn start_points(data: &[u8]) -> Result<Vec<StartPoint>, DatError> {
         let cls = String::from_utf8_lossy(r.take(nlen)?).into_owned();
         let nprops = r.u32()? as usize;
         let mut pos = None;
+        let mut rot = [0.0; 3];
         let mut label = String::new();
         for _ in 0..nprops {
             let pl = r.u16()? as usize;
@@ -402,13 +556,20 @@ pub fn start_points(data: &[u8]) -> Result<Vec<StartPoint>, DatError> {
                     label = String::from_utf8_lossy(&val[2..2 + sl]).into_owned();
                 }
             }
+            if cls == "GameStartPoint" && pname == "Rotation" && ptype == 1 && val.len() >= 12 {
+                rot = [
+                    f32::from_le_bytes(val[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(val[4..8].try_into().unwrap()),
+                    f32::from_le_bytes(val[8..12].try_into().unwrap()),
+                ];
+            }
         }
         if r.p > ds + objsz {
             return Err(DatError::BadHeader("object overrun"));
         }
         r.p = ds + objsz;
         if let Some(pos) = pos {
-            out.push(StartPoint { name: label, pos });
+            out.push(StartPoint { name: label, pos, rot });
         }
     }
     Ok(out)
@@ -678,7 +839,86 @@ enum ObjProp {
     Vec([f32; 3]),
     Num(f32),
     Byte(u8),
+    /// Type 7, `(x, y, z, w)`.
+    Quat([f32; 4]),
     Str(String),
+}
+
+/// A light authored in the DAT object list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightKind {
+    /// `GlobalDirLight`. Shines along a direction, not from a nearby point.
+    Directional,
+    /// `DirLight`. A cone, usually a ceiling spot.
+    Spot,
+    /// `Light` or `ObjectLight`.
+    Point,
+}
+
+#[derive(Clone, Debug)]
+pub struct LevelLight {
+    pub kind: LightKind,
+    pub name: String,
+    pub pos: [f32; 3],
+    /// `(x, y, z, w)`. Identity when the object has no Rotation.
+    pub rotation: [f32; 4],
+    /// Linear 0–1. File colors above 1.5 are divided by 255.
+    pub color: [f32; 3],
+    pub bright: f32,
+    pub radius: f32,
+    /// Full cone in degrees. Spots only; 90 when the file omits it.
+    pub fov_deg: f32,
+}
+
+/// Directional, spot, and point lights from the object list.
+pub fn read_lights(data: &[u8]) -> Result<Vec<LevelLight>, DatError> {
+    let raw = raw_objects(data)?;
+    let mut out = Vec::new();
+    for (class, props) in raw {
+        let kind = match class.as_str() {
+            "GlobalDirLight" => LightKind::Directional,
+            "DirLight" => LightKind::Spot,
+            "Light" | "ObjectLight" => LightKind::Point,
+            _ => continue,
+        };
+        let color = unit_color(
+            prop_vec_opt(&props, "InnerColor")
+                .or_else(|| prop_vec_opt(&props, "LightColor"))
+                .or_else(|| prop_vec_opt(&props, "Color"))
+                .unwrap_or([1.0, 1.0, 1.0]),
+        );
+        let big = prop_vec_opt(&props, "BigDims").unwrap_or([0.0; 3]);
+        let radius = prop_f32(&props, "LightRadius");
+        let radius = if radius > 1.0 {
+            radius
+        } else {
+            big[0].abs().max(big[1].abs()).max(big[2].abs())
+        };
+        let mut bright = prop_f32(&props, "BrightScale");
+        if bright <= 0.0 {
+            bright = 1.0;
+        }
+        let mut fov = prop_f32(&props, "FOV");
+        if fov <= 1.0 {
+            fov = 90.0;
+        }
+        out.push(LevelLight {
+            kind,
+            name: prop_str(&props, "Name"),
+            pos: prop_vec(&props, "Pos"),
+            rotation: prop_quat(&props, "Rotation").unwrap_or([0.0, 0.0, 0.0, 1.0]),
+            color,
+            bright,
+            radius,
+            fov_deg: fov,
+        });
+    }
+    Ok(out)
+}
+
+fn unit_color(c: [f32; 3]) -> [f32; 3] {
+    let scale = if c.iter().any(|v| *v > 1.5) { 1.0 / 255.0 } else { 1.0 };
+    [c[0] * scale, c[1] * scale, c[2] * scale]
 }
 
 fn raw_objects(data: &[u8]) -> Result<Vec<(String, Vec<(String, ObjProp)>)>, DatError> {
@@ -719,6 +959,13 @@ fn raw_objects(data: &[u8]) -> Result<Vec<(String, Vec<(String, ObjProp)>)>, Dat
                 ObjProp::Num(f32::from_le_bytes(val[0..4].try_into().unwrap()))
             } else if ptype == 5 && !val.is_empty() {
                 ObjProp::Byte(val[0])
+            } else if ptype == 7 && val.len() >= 16 {
+                ObjProp::Quat([
+                    f32::from_le_bytes(val[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(val[4..8].try_into().unwrap()),
+                    f32::from_le_bytes(val[8..12].try_into().unwrap()),
+                    f32::from_le_bytes(val[12..16].try_into().unwrap()),
+                ])
             } else if let Some(s) = lt_string(val) {
                 ObjProp::Str(s)
             } else {
@@ -763,6 +1010,10 @@ fn prop_flag(props: &[(String, ObjProp)], key: &str) -> bool {
 }
 
 fn prop_vec(props: &[(String, ObjProp)], key: &str) -> [f32; 3] {
+    prop_vec_opt(props, key).unwrap_or([0.0, 0.0, 0.0])
+}
+
+fn prop_vec_opt(props: &[(String, ObjProp)], key: &str) -> Option<[f32; 3]> {
     props
         .iter()
         .find(|(name, _)| name == key)
@@ -770,7 +1021,16 @@ fn prop_vec(props: &[(String, ObjProp)], key: &str) -> [f32; 3] {
             ObjProp::Vec(v) => Some(*v),
             _ => None,
         })
-        .unwrap_or([0.0, 0.0, 0.0])
+}
+
+fn prop_quat(props: &[(String, ObjProp)], key: &str) -> Option<[f32; 4]> {
+    props
+        .iter()
+        .find(|(name, _)| name == key)
+        .and_then(|(_, prop)| match prop {
+            ObjProp::Quat(q) => Some(*q),
+            _ => None,
+        })
 }
 
 /// Title from the world header, e.g. `The Ambush`.
@@ -895,5 +1155,48 @@ mod tests {
         let door = mission.doors.iter().find(|d| d.name == "door2").expect("door2");
         assert!((door.open_wait - 3.0).abs() < 0.1);
         assert_eq!(door.state_flags & 1, 1);
+        let models = world_models(&data).unwrap();
+        assert_eq!(models.len(), 54);
+        let lift_brush = models.iter().find(|m| m.name == "mainlift").expect("mainlift brush");
+        assert!(lift_brush.poly_count > 0 && lift_brush.tri_count() > 0);
+        let brush = models.iter().find(|m| m.name == "door2").expect("door2 brush");
+        assert_eq!(brush.point_count, 8);
+        assert_eq!(brush.poly_count, 6);
+        assert!(brush.tri_count() >= 4);
+        let ext = [
+            brush.max[0] - brush.min[0],
+            brush.max[1] - brush.min[1],
+            brush.max[2] - brush.min[2],
+        ];
+        assert!((ext[0] - 16.0).abs() < 0.5, "{ext:?}");
+        assert!((ext[1] - 128.0).abs() < 0.5 && (ext[2] - 128.0).abs() < 0.5, "{ext:?}");
+        let center = [
+            (brush.min[0] + brush.max[0]) * 0.5,
+            (brush.min[1] + brush.max[1]) * 0.5,
+            (brush.min[2] + brush.max[2]) * 0.5,
+        ];
+        assert!((center[0] - 80.0).abs() < 0.5, "{center:?}");
+        assert!((center[1] - 32.0).abs() < 0.5 && (center[2] - 1216.0).abs() < 0.5, "{center:?}");
+    }
+
+    #[test]
+    fn ambush_world_model_and_sun() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../extracted/SHOGO/WORLDS/01_AMBUSH.DAT");
+        if !path.exists() {
+            return;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let models = world_models(&data).unwrap();
+        let barb = models.iter().find(|m| m.name == "barb1").expect("barb1");
+        assert!(barb.poly_count > 0 && barb.tri_count() > 0);
+        let lights = read_lights(&data).unwrap();
+        let sun = lights
+            .iter()
+            .find(|l| l.kind == LightKind::Directional)
+            .expect("GlobalDirLight");
+        assert_eq!(sun.rotation, [0.0, 0.0, 0.0, 1.0]);
+        assert!((sun.color[0] - 200.0 / 255.0).abs() < 0.01, "{:?}", sun.color);
+        assert!((sun.pos[0] + 8448.0).abs() < 1.0, "{:?}", sun.pos);
     }
 }

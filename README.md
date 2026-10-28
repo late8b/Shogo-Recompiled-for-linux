@@ -17,12 +17,12 @@ asset-format specs, recovered C++ class names).
 | DTX textures → PNG | **Done** — 3,641 / 3,675 decoded (34 are zero-dim placeholders) |
 | ABC models → glTF | **Done** — 538 / 538 models, exact byte consumption |
 | Rust asset decoders | **Done** — `shogo-assets` (DTX, ABC bind pose, DAT v56), unit-tested |
-| Bevy runtime | **Mission 1 playable** — original DAT/ABC/DTX/PCX/WAV, menu, bumper, combat, save, triggers, doors, objectives |
+| Bevy runtime | **Ambush playable, exit loads the next DAT** — original DAT/ABC/DTX/PCX/WAV, menu, bumper, combat, save, triggers, doors, objectives |
 | DAT world objects/properties | **Done** — grammar verified; cast, triggers, keys, and doors come from the object list |
 | DAT world geometry | **Done** — v56 WorldBSP on all 60 worlds; native decoder plus `ltdat.py` / `dat2glb.py` |
 | Ghidra decompilation | **Reference only** — 6,455 functions in `decompiled/`; not a rebuilt executable |
-| Mission script | **Slice** — trigger volumes, objectives, patrol keys, keyframers, breakable doors, sliding doors |
-| Full campaign | Exit names the next world and does not load it. Door panels are cuboids. Retail physics is still in the dump |
+| Mission script | **Slice** — trigger volumes, objectives, patrol keys, keyframers, breakable doors, sliding doors, level change |
+| Full campaign | Ambush → Quarters is played. Later exits use the same loader. Door panels are cuboids. The HUD prints objective and transmission ids. Retail physics is still in the dump |
 
 ## Repository layout
 
@@ -44,7 +44,7 @@ converted/                ready-to-use assets
   worlds/                 .glb (mirrors the DAT tree)
 rust/                     Cargo workspace
   crates/shogo-assets/    native DTX, ABC, and DAT decoders (no Bevy dependency)
-  crates/shogo-viewer/    Bevy runtime: menu, Ambush, combat, mission script, save
+  crates/shogo-viewer/    Bevy runtime: menu, Ambush, level change, combat, mission script, save
 embedded/                 the 4 game-logic DLLs extracted from SHOGO.REZ
 decompiled/               Ghidra decompiler output (6,455 functions)
 ghidra/                   headless decompile script
@@ -153,10 +153,13 @@ Full detail in `docs/FINDINGS.md`.
 4. **Gameplay rewrite** — mission 1 is playable (menu, bumper, authored cast,
    two weapons, on-foot/MCA, one continue file). The same loop runs the DAT
    mission graph: trigger volumes, objective ids, `FollowPath` on AI keys,
-   keyframers, breakable barricades, and sliding doors. A finished exit shows
-   the next world name. It does not load that world. Door panels are cuboids.
-   Transmissions show a string id. The retail physics octree is still only in
-   the decompiler output.
+   keyframers, breakable barricades, and sliding doors. An unlocked exit
+   despawns the current level and loads the next `.DAT` in that `WORLDS`
+   folder, keeping the player's health, ammo, and weapon. Ambush's exit has
+   been walked into **Calm Before the Storm** (`02_QUARTERS.DAT`, the hangar)
+   at `start1`. Door panels are cuboids. The HUD still prints `Objective {id}`
+   and `Transmission {StringID}`. Continue from the menu still boots Ambush.
+   The retail physics octree is still only in the decompiler output.
 
 ## Licensing note
 

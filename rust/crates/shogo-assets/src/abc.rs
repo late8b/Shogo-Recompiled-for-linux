@@ -13,8 +13,10 @@
 //!
 //! The next property begins exactly at `endOffset`. Top-level properties:
 //! `Header`, `Geometry`, `Nodes`, `Animation`. Geometry vertices are stored in
-//! each piece's local space. `Nodes` names those pieces, and the first
-//! `static_model` animation is the bind pose that assembles them.
+//! each piece's local space. `Nodes` is the piece tree, and keyframe 0 of the
+//! `static_model` animation is the bind pose. The vertex transform is the one
+//! in `FUN_004348d0`: the node matrix from `FUN_00435ad0` is applied as
+//! `x' = m0·v + m3` (the transpose of the quaternion's column matrix).
 //!
 //! ```text
 //! 24B   bbox: f32 min.xyz, max.xyz
@@ -222,276 +224,281 @@ pub fn decode(data: &[u8], name: &str) -> Result<AbcModel, AbcError> {
     })
 }
 
-#[derive(Clone, Copy)]
-struct BindXform {
+struct Piece {
+    index: usize,
+    flags: u8,
+    kids: Vec<usize>,
+}
+
+struct NodeAnim {
     pos: [f32; 3],
     quat: [f32; 4],
-    scale: [f32; 3],
+    s1: [f32; 3],
+    s2: [f32; 3],
 }
 
-/// Piece names in `Nodes`, in file order. The last piece has no local bounds.
-fn node_names(blob: &[u8]) -> Vec<String> {
-    let mut start = if name_len_at(blob, 24).is_some() { 24 } else { 0 };
-    let mut names = Vec::new();
-    while let Some(n) = name_len_at(blob, start) {
-        names.push(String::from_utf8_lossy(&blob[start + 2..start + 2 + n]).into_owned());
-        let after = start + 2 + n + 11;
-        let with_bounds = after + 24;
-        if name_len_at(blob, with_bounds).is_some() {
-            start = with_bounds;
-        } else {
-            break;
-        }
+struct Cur<'a> {
+    d: &'a [u8],
+    p: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn rest(&self) -> usize {
+        self.d.len().saturating_sub(self.p)
     }
-    names
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.rest() < n {
+            return None;
+        }
+        let s = &self.d[self.p..self.p + n];
+        self.p += n;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        let b = self.take(2)?;
+        Some(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let b = self.take(4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn f32(&mut self) -> Option<f32> {
+        let b = self.take(4)?;
+        let v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        v.is_finite().then_some(v)
+    }
+    fn vec3(&mut self) -> Option<[f32; 3]> {
+        Some([self.f32()?, self.f32()?, self.f32()?])
+    }
+    fn str16(&mut self) -> Option<String> {
+        let n = self.u16()? as usize;
+        if n > 256 {
+            return None;
+        }
+        let b = self.take(n)?;
+        Some(String::from_utf8_lossy(b).into_owned())
+    }
 }
 
-fn name_len_at(blob: &[u8], i: usize) -> Option<usize> {
-    let n = u16_at(blob, i).ok()? as usize;
-    if !(1..=40).contains(&n) || i + 2 + n > blob.len() {
+/// `Nodes` property (`FUN_00434dc0`): local bounds, name, preorder index, flags,
+/// a u16 list, then children. The bounds are the piece's own box, not the pose.
+fn read_pieces(blob: &[u8]) -> Option<Vec<Piece>> {
+    let mut c = Cur { d: blob, p: 0 };
+    let mut pieces = Vec::new();
+    read_piece(&mut c, &mut pieces)?;
+    (!pieces.is_empty() && pieces.len() <= 512).then_some(pieces)
+}
+
+fn read_piece(c: &mut Cur, pieces: &mut Vec<Piece>) -> Option<usize> {
+    let _bounds_a = c.vec3()?;
+    let _bounds_b = c.vec3()?;
+    let _name = c.str16()?;
+    let index = c.u16()? as usize;
+    if index > 4096 {
         return None;
     }
-    let bytes = &blob[i + 2..i + 2 + n];
-    bytes.iter().all(|b| (32..127).contains(b)).then_some(n)
+    let flags = c.u8()?;
+    let extra = c.u32()? as usize;
+    if extra > 10_000 {
+        return None;
+    }
+    c.take(extra * 2)?;
+    let n_child = c.u32()? as usize;
+    if n_child > 256 {
+        return None;
+    }
+    let slot = pieces.len();
+    pieces.push(Piece {
+        index,
+        flags,
+        kids: Vec::new(),
+    });
+    let mut kids = Vec::with_capacity(n_child);
+    for _ in 0..n_child {
+        kids.push(read_piece(c, pieces)?);
+    }
+    pieces[slot].kids = kids;
+    Some(slot)
 }
 
-/// Payload after the `static_model` name and its following u32.
-fn static_model_payload(anim: &[u8]) -> Option<&[u8]> {
-    let mut i = 0usize;
-    while i + 14 <= anim.len() {
-        if let Ok(n) = u16_at(anim, i) {
-            if n == 12 && i + 2 + 12 + 4 <= anim.len() {
-                let name = &anim[i + 2..i + 2 + 12];
-                if name.eq_ignore_ascii_case(b"static_model") {
-                    return Some(&anim[i + 2 + 12 + 4..]);
-                }
-            }
+/// Keyframe 0 of `static_model`, one record per node in preorder.
+/// Layout matches `FUN_00434ef0` / `FUN_004350f0`: the animation header, then
+/// per node `nKeys` × 28-byte poses followed by the two scale vectors.
+fn static_model_anims(anim: &[u8], n_nodes: usize) -> Option<Vec<NodeAnim>> {
+    if n_nodes == 0 {
+        return None;
+    }
+    let mut c = Cur { d: anim, p: 0 };
+    let n_anims = c.u32()? as usize;
+    if n_anims == 0 || n_anims > 512 {
+        return None;
+    }
+    for _ in 0..n_anims {
+        let name = c.str16()?;
+        let _unk = c.u32()?;
+        let _min = c.vec3()?;
+        let _max = c.vec3()?;
+        let n_keys = c.u32()? as usize;
+        if n_keys == 0 || n_keys > 20_000 {
+            return None;
         }
-        i += 1;
+        for _ in 0..n_keys {
+            let _time = c.f32()?;
+            let _a = c.vec3()?;
+            let _b = c.vec3()?;
+            let _label = c.str16()?;
+        }
+        let mut nodes = Vec::with_capacity(n_nodes);
+        for _ in 0..n_nodes {
+            let pos = c.vec3()?;
+            let quat = [c.f32()?, c.f32()?, c.f32()?, c.f32()?];
+            for _ in 1..n_keys {
+                c.take(28)?;
+            }
+            let s1 = c.vec3()?;
+            let s2 = c.vec3()?;
+            nodes.push(NodeAnim { pos, quat, s1, s2 });
+        }
+        if name.eq_ignore_ascii_case("static_model") {
+            return Some(nodes);
+        }
     }
     None
 }
 
-fn bind_pose(nodes: &[u8], anim: &[u8]) -> Option<Vec<BindXform>> {
-    let names = node_names(nodes);
-    let count = names.len();
-    if count == 0 {
-        return None;
-    }
-    let payload = static_model_payload(anim)?;
-    let mut start = 0usize;
-    while start + count * 80 <= payload.len() {
-        if (0..count).all(|i| bind_record(payload, start + i * 80)) {
-            let mut local = Vec::with_capacity(count);
-            for i in 0..count {
-                let o = start + i * 80;
-                local.push(BindXform {
-                    pos: [f32_at(payload, o).ok()?, f32_at(payload, o + 4).ok()?, f32_at(payload, o + 8).ok()?],
-                    quat: bind_quat(payload, o + 12)?,
-                    scale: sane_scale([
-                        f32_at(payload, o + 56).ok()?,
-                        f32_at(payload, o + 60).ok()?,
-                        f32_at(payload, o + 64).ok()?,
-                    ]),
-                });
-            }
-            let parents: Vec<Option<usize>> = (0..count).map(|i| parent_index(&names, i)).collect();
-            return Some(accumulate_bind(&local, &parents));
-        }
-        start += 4;
-    }
-    None
-}
-
-/// Limb records are parent-local. Names follow the retail skeleton
-/// (`torso` → `armu` → `arml` → hand, and the same for legs).
-fn parent_index(names: &[String], i: usize) -> Option<usize> {
-    if i == 0 {
-        return None;
-    }
-    let name = names[i].to_ascii_lowercase();
-    let earlier = |pred: &dyn Fn(&str) -> bool| -> Option<usize> {
-        (0..i).rev().find(|j| pred(&names[*j].to_ascii_lowercase()))
-    };
-    let side = if name.contains("left") {
-        "left"
-    } else if name.contains("right") {
-        "right"
-    } else {
-        ""
-    };
-    let same_side = |n: &str| side.is_empty() || n.contains(side);
-    let first = |pred: &dyn Fn(&str) -> bool| -> Option<usize> {
-        (0..i).find(|j| pred(&names[*j].to_ascii_lowercase()))
-    };
-    // Numbered torso plates are siblings of the limbs, so arms and the plates
-    // themselves hang off the first `torso` rather than off `torso_1`.
-    let main_torso = || first(&|n| n == "torso").or_else(|| first(&|n| n.contains("torso")));
-    if name.contains("gun") {
-        return earlier(&|n| n.contains("hand") && !n.contains("gun"))
-            .or_else(|| earlier(&|n| n.contains("arml") && same_side(n)));
-    }
-    if name.contains("hand") || name.contains("shield") {
-        return earlier(&|n| {
-            n.contains("arml") && !n.contains("hand") && !n.contains("shield") && same_side(n)
-        })
-        .or_else(|| earlier(&|n| n.contains("arm") && same_side(n)));
-    }
-    if name.contains("arml") {
-        // The forearm hangs off the first upper-arm bone. A later `armu_2`
-        // shell is a sibling plate, not the bone.
-        return first(&|n| {
-            n.contains("armu") && !n.contains("shoulder") && !n.contains("arml") && same_side(n)
-        })
-        .or_else(|| earlier(&|n| n.contains("armu") && !n.contains("arml") && same_side(n)));
-    }
-    if name.contains("shoulder") {
-        return main_torso();
-    }
-    if name.contains("armu") {
-        return earlier(&|n| n.contains("armu") && !n.contains("shoulder") && same_side(n))
-            .or_else(|| earlier(&|n| n.contains("shoulder") && same_side(n)))
-            .or_else(main_torso);
-    }
-    if name.contains("heel") {
-        return earlier(&|n| n.contains("legl") && !n.contains("heel") && !n.contains("foot") && same_side(n));
-    }
-    if name.contains("foot") || name.contains("shoe") {
-        return earlier(&|n| {
-            n.contains("legl") && !n.contains("foot") && !n.contains("shoe") && !n.contains("heel") && same_side(n)
-        });
-    }
-    if name.contains("legl") {
-        return earlier(&|n| n.contains("legu") && same_side(n));
-    }
-    if name.contains("legu") {
-        return earlier(&|n| n.contains("pelvis"));
-    }
-    if name.contains("head") {
-        return earlier(&|n| n.contains("head")).or_else(main_torso);
-    }
-    if name == "pelvis" {
-        // `pelvis_1` can sit earlier as a helper pivot. The hip bone itself
-        // hangs off the torso, or the legs swing out with that pivot.
-        return main_torso().or(Some(0));
-    }
-    if name.contains("pelvis") {
-        return earlier(&|n| n.contains("pelvis")).or_else(main_torso);
-    }
-    if name.contains("torso") {
-        return main_torso().or(Some(0));
-    }
-    Some(0)
-}
-
-fn accumulate_bind(local: &[BindXform], parents: &[Option<usize>]) -> Vec<BindXform> {
-    let mut global = Vec::with_capacity(local.len());
-    for (i, limb) in local.iter().enumerate() {
-        global.push(match parents[i] {
-            Some(p) => {
-                let parent: BindXform = global[p];
-                let t = rotate_quat(parent.quat, limb.pos);
-                BindXform {
-                    pos: [t[0] + parent.pos[0], t[1] + parent.pos[1], t[2] + parent.pos[2]],
-                    quat: quat_mul(parent.quat, limb.quat),
-                    scale: limb.scale,
-                }
-            }
-            None => *limb,
-        });
-    }
-    global
-}
-
-fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    let (ax, ay, az, aw) = (a[0], a[1], a[2], a[3]);
-    let (bx, by, bz, bw) = (b[0], b[1], b[2], b[3]);
+fn identity() -> [f32; 16] {
     [
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ]
 }
 
-/// A bind record is 80 bytes: position, quaternion, a duplicate of that pose,
-/// then scale. Later keyframes share the layout, so the duplicate and a
-/// near-unit scale reject a chance run of unit quaternions.
-fn bind_record(data: &[u8], o: usize) -> bool {
-    let Ok(floats) = read_floats(data, o, 17) else {
-        return false;
-    };
-    let pos_dup = floats[0..3].iter().zip(&floats[7..10]).all(|(a, b)| (a - b).abs() < 0.05);
-    let quat_dup = floats[3..7].iter().zip(&floats[10..14]).all(|(a, b)| (a - b).abs() < 0.02);
-    let scale_ok = floats[14..17].iter().all(|s| (0.25..4.0).contains(&s.abs()));
-    pos_dup && quat_dup && scale_ok && quat_usable(&floats[3..7])
+/// Column-vector quaternion matrix, `(x, y, z, w)`, matching `FUN_00435ad0`.
+/// The 2/len² factor is the engine's normalize-and-double.
+fn quat_matrix(q: [f32; 4]) -> [f32; 9] {
+    let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+    let len2 = x * x + y * y + z * z + w * w;
+    if len2 < 1.0e-12 {
+        return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    }
+    let s = 2.0 / len2;
+    let (xx, yy, zz) = (s * x * x, s * y * y, s * z * z);
+    let (xy, xz, yz) = (s * x * y, s * x * z, s * y * z);
+    let (wx, wy, wz) = (s * w * x, s * w * y, s * w * z);
+    [
+        1.0 - (yy + zz),
+        xy - wz,
+        xz + wy,
+        xy + wz,
+        1.0 - (xx + zz),
+        yz - wx,
+        xz - wy,
+        yz + wx,
+        1.0 - (xx + yy),
+    ]
 }
 
-fn read_floats(data: &[u8], o: usize, n: usize) -> Result<Vec<f32>, AbcError> {
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let v = f32_at(data, o + i * 4)?;
-        if !v.is_finite() || v.abs() > 1.0e5 {
-            return Err(AbcError::Truncated);
+/// Child matrix from parent `p` and the local quaternion matrix `r` plus
+/// translation. This is the store in `FUN_00435ad0`: the rotation block is
+/// written transposed relative to a column-vector multiply.
+fn compose(p: &[f32; 16], r: &[f32; 9], t: [f32; 3]) -> [f32; 16] {
+    let (r00, r01, r02, r10, r11, r12, r20, r21, r22) =
+        (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]);
+    let (tx, ty, tz) = (t[0], t[1], t[2]);
+    [
+        r00 * p[0] + r01 * p[1] + r02 * p[2],
+        r10 * p[0] + r11 * p[1] + r12 * p[2],
+        r20 * p[0] + r21 * p[1] + r22 * p[2],
+        tx * p[0] + ty * p[1] + tz * p[2] + p[3],
+        r00 * p[4] + r01 * p[5] + r02 * p[6],
+        r10 * p[4] + r11 * p[5] + r12 * p[6],
+        r20 * p[4] + r21 * p[5] + r22 * p[6],
+        tx * p[4] + ty * p[5] + tz * p[6] + p[7],
+        r00 * p[8] + r01 * p[9] + r02 * p[10],
+        r10 * p[8] + r11 * p[9] + r12 * p[10],
+        r20 * p[8] + r21 * p[9] + r22 * p[10],
+        tx * p[8] + ty * p[9] + tz * p[10] + p[11],
+        r00 * p[12] + r01 * p[13] + r02 * p[14],
+        r10 * p[12] + r11 * p[13] + r12 * p[14],
+        r20 * p[12] + r21 * p[13] + r22 * p[14],
+        tx * p[12] + ty * p[13] + tz * p[14] + p[15],
+    ]
+}
+
+/// `FUN_0041c2e0`: row-major `out = a * b`.
+fn mat_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut o = [0.0; 16];
+    for row in 0..4 {
+        for col in 0..4 {
+            let mut s = 0.0;
+            for k in 0..4 {
+                s += a[row * 4 + k] * b[k * 4 + col];
+            }
+            o[row * 4 + col] = s;
         }
-        out.push(v);
     }
-    Ok(out)
+    o
 }
 
-fn quat_usable(q: &[f32]) -> bool {
-    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    (0.95..1.05).contains(&len) || len < 0.5
+/// Scale then offset, applied to the vertex before the node matrix.
+/// Flag bit 4 (`FUN_00435ad0`) is the only path that uses it.
+fn scale_matrix(s1: [f32; 3], s2: [f32; 3]) -> [f32; 16] {
+    [
+        s1[0], 0.0, 0.0, s2[0], 0.0, s1[1], 0.0, s2[1], 0.0, 0.0, s1[2], s2[2], 0.0, 0.0, 0.0, 1.0,
+    ]
 }
 
-fn bind_quat(data: &[u8], o: usize) -> Option<[f32; 4]> {
-    let q = [
-        f32_at(data, o).ok()?,
-        f32_at(data, o + 4).ok()?,
-        f32_at(data, o + 8).ok()?,
-        f32_at(data, o + 12).ok()?,
-    ];
-    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    if len < 0.5 {
-        Some([0.0, 0.0, 0.0, 1.0])
-    } else if (0.95..1.05).contains(&len) {
-        Some(q)
-    } else {
-        None
+fn bind_pose(nodes: &[u8], anim: &[u8]) -> Option<Vec<[f32; 16]>> {
+    let pieces = read_pieces(nodes)?;
+    let anims = static_model_anims(anim, pieces.len())?;
+    if anims.len() != pieces.len() {
+        return None;
     }
+    let mut mats = vec![identity(); pieces.len()];
+    fill_bind(0, identity(), &pieces, &anims, &mut mats)?;
+    Some(mats)
 }
 
-fn sane_scale(scale: [f32; 3]) -> [f32; 3] {
-    if scale.iter().all(|s| s.is_finite() && (0.25..4.0).contains(&s.abs())) {
-        scale
-    } else {
-        [1.0, 1.0, 1.0]
+fn fill_bind(
+    slot: usize,
+    parent: [f32; 16],
+    pieces: &[Piece],
+    anims: &[NodeAnim],
+    mats: &mut Vec<[f32; 16]>,
+) -> Option<()> {
+    let piece = pieces.get(slot)?;
+    let anim = anims.get(slot)?;
+    let local = quat_matrix(anim.quat);
+    let mut m = compose(&parent, &local, anim.pos);
+    let kids = piece.kids.clone();
+    let flags = piece.flags;
+    let index = piece.index;
+    let s1 = anim.s1;
+    let s2 = anim.s2;
+    for kid in kids {
+        fill_bind(kid, m, pieces, anims, mats)?;
     }
+    if flags & 4 != 0 {
+        m = mat_mul(&m, &scale_matrix(s1, s2));
+    }
+    if index >= mats.len() {
+        mats.resize(index + 1, identity());
+    }
+    mats[index] = m;
+    Some(())
 }
 
-fn pose_vertex(pos: [f32; 3], node: u8, bind: Option<&[BindXform]>) -> [f32; 3] {
-    let Some(xf) = bind.and_then(|b| b.get(node as usize)) else {
+/// `FUN_004348d0`. `m[0..3]` is the first row, so this is `Rᵀ v + t`.
+fn pose_vertex(pos: [f32; 3], node: u8, bind: Option<&[[f32; 16]]>) -> [f32; 3] {
+    let Some(m) = bind.and_then(|b| b.get(node as usize)) else {
         return pos;
     };
-    let scaled = [
-        pos[0] * xf.scale[0],
-        pos[1] * xf.scale[1],
-        pos[2] * xf.scale[2],
-    ];
-    let r = rotate_quat(xf.quat, scaled);
-    [r[0] + xf.pos[0], r[1] + xf.pos[1], r[2] + xf.pos[2]]
-}
-
-/// Rotate `v` by a unit quaternion stored as `(x, y, z, w)`.
-fn rotate_quat(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
-    let (qx, qy, qz, w) = (q[0], q[1], q[2], q[3]);
-    let tx = 2.0 * (qy * v[2] - qz * v[1]);
-    let ty = 2.0 * (qz * v[0] - qx * v[2]);
-    let tz = 2.0 * (qx * v[1] - qy * v[0]);
     [
-        v[0] + w * tx + (qy * tz - qz * ty),
-        v[1] + w * ty + (qz * tx - qx * tz),
-        v[2] + w * tz + (qx * ty - qy * tx),
+        m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3],
+        m[4] * pos[0] + m[5] * pos[1] + m[6] * pos[2] + m[7],
+        m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11],
     ]
 }
 
@@ -571,15 +578,31 @@ mod tests {
                 max[i] = max[i].max(p[i]);
             }
         }
-        let ext = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-        let wide = ext[0].max(ext[2]);
-        // Flat piece transforms leave a ~68-tall cloud. Chaining each limb onto
-        // its parent closes the figure up to about 90, still near the
-        // static-model bounds.
-        assert!(
-            ext[1] > wide * 1.5 && (80.0..130.0).contains(&ext[1]),
-            "extents {ext:?} min {min:?} max {max:?}"
-        );
+        // `static_model` key 0 bounds. Y is the tall axis (feet below the
+        // origin, head above). The old 80-byte heuristic smushed this cloud.
+        let want_min = [-19.6_f32, -44.6, -30.7];
+        let want_max = [19.3_f32, 39.1, 25.2];
+        for i in 0..3 {
+            assert!(
+                (min[i] - want_min[i]).abs() < 0.4 && (max[i] - want_max[i]).abs() < 0.4,
+                "min {min:?} max {max:?}"
+            );
+        }
+        assert!(max[1] > 0.0 && min[1] < 0.0, "min {min:?} max {max:?}");
+    }
+
+    #[test]
+    fn engine_bind_uses_the_transposed_rotation() {
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let m = compose(&identity(), &quat_matrix([0.0, 0.0, s, s]), [0.0, 0.0, 0.0]);
+        let p = pose_vertex([1.0, 0.0, 0.0], 0, Some(&[m]));
+        assert!(p[0].abs() < 1e-5 && (p[1] + 1.0).abs() < 1e-5 && p[2].abs() < 1e-5, "{p:?}");
+
+        let mut parent = identity();
+        parent[3] = 10.0;
+        let child = compose(&parent, &quat_matrix([0.0, 0.0, 0.0, 1.0]), [1.0, 0.0, 0.0]);
+        let p = pose_vertex([0.0, 0.0, 0.0], 0, Some(&[child]));
+        assert!((p[0] - 11.0).abs() < 1e-4 && p[1].abs() < 1e-4 && p[2].abs() < 1e-4, "{p:?}");
     }
 
     #[test]
@@ -605,12 +628,15 @@ mod tests {
             }
             let ext = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
             let wide = ext[0].max(ext[2]);
-            // A broad mech can be nearly as wide as it is tall. A stacked
-            // pile of unposed parts is much wider than it is tall, and a
-            // misread scale stretches a figure past a few hundred units.
+            // A bulky MCA can be a little deeper than it is tall. An unposed
+            // pile is much wider than it is tall, and a bad scale runs past
+            // a few hundred units. The figure stands through the origin on Y.
             assert!(
-                ext[1] > wide * 0.9 && (50.0..280.0).contains(&ext[1]),
-                "{rel} extents {ext:?}"
+                ext[1] > wide * 0.75
+                    && (50.0..280.0).contains(&ext[1])
+                    && min[1] < 0.0
+                    && max[1] > 0.0,
+                "{rel} extents {ext:?} min {min:?} max {max:?}"
             );
         }
     }

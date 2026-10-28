@@ -27,12 +27,16 @@
 mod arena;
 mod collide;
 mod combat;
+mod door_audio;
+mod feedback;
 mod front;
 mod script;
 mod input;
 mod nav;
 mod pad;
+mod transmission;
 mod tune;
+mod waypoint;
 
 use std::f32::consts::PI;
 
@@ -41,6 +45,8 @@ use bevy::image::{Image, ImageAddressMode, ImageFilterMode, ImageSampler, ImageS
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::camera::visibility::RenderLayers;
+use bevy::ecs::observer::On;
+use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
@@ -66,6 +72,7 @@ fn main() {
         .init_resource::<front::Paused>()
         .init_resource::<front::Launch>()
         .insert_resource(tune::Mixer::start())
+        .insert_resource(transmission::Dialogue::load())
         .add_systems(OnEnter(front::Screen::Mission), (
             front::dismiss,
             spawn_stage,
@@ -88,15 +95,25 @@ fn main() {
                 script::drive,
                 combat::waves,
                 script::touch_volumes,
+                waypoint::project,
                 script::doors,
                 combat::enemies,
+                // enemies() rewrites yaw each tick. The flinch is applied after that write.
+                feedback::flinch,
+                feedback::flash,
+                feedback::debris,
                 combat::muzzle_flashes,
                 combat::hud,
                 script::readout,
+                perform_transition,
             )
                 .chain()
                 .run_if(front::sim_runs),
-        );
+        )
+        .add_observer(queue_transition)
+        .add_observer(door_audio::on_barricade)
+        .add_observer(feedback::on_hit)
+        .init_resource::<feedback::DebrisBank>();
     front::install(&mut app);
     app.run();
 }
@@ -134,6 +151,27 @@ pub(crate) struct Player {
     pub(crate) reserve: [u16; 2],
     /// Seconds left on a reload. 0 means the gun is ready.
     pub(crate) reloading: f32,
+}
+
+/// Geometry, cast, triggers, and props that belong to the loaded world.
+/// The player, their guns, and the HUD do not carry this, so a transition
+/// can clear the map and keep health, ammo, and weapons.
+#[derive(Component)]
+pub(crate) struct LevelEntity;
+
+/// Path of the world currently in memory. Boot still comes from `world_path`.
+#[derive(Resource, Clone)]
+pub(crate) struct CampaignFile(pub String);
+
+/// Named `GameStartPoint` to use the next time the world loader places the player.
+#[derive(Resource)]
+struct SpawnRequest(String);
+
+/// Exit resolved to a real `.DAT`, waiting for the end of this tick.
+#[derive(Resource)]
+struct PendingTransition {
+    path: String,
+    spawn: String,
 }
 
 #[derive(Resource)]
@@ -195,14 +233,6 @@ impl BodyTune {
 }
 
 fn spawn_stage(mut commands: Commands) {
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 12_000.0,
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.6, 0.0)),
-    ));
     // SHOGO_GRAB=0 leaves the mouse free so a still frame shows the spawn view.
     let grab = std::env::var("SHOGO_GRAB").ok().as_deref() != Some("0");
     commands.insert_resource(LookGrabbed(grab));
@@ -221,6 +251,13 @@ fn spawn_stage(mut commands: Commands) {
             ..default()
         }),
         Transform::default(),
+        bevy::light::ShadowFilteringMethod::Hardware2x2,
+        bevy::post_process::bloom::Bloom::OLD_SCHOOL,
+        AmbientLight {
+            color: Color::WHITE,
+            brightness: 180.0,
+            affects_lightmapped_meshes: true,
+        },
         Player {
             yaw: 0.0,
             pitch: 0.0,
@@ -242,7 +279,28 @@ fn spawn_stage(mut commands: Commands) {
     ));
 }
 
+static ACTIVE_WORLD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn remember_world(path: &str) {
+    if let Ok(mut slot) = ACTIVE_WORLD.lock() {
+        *slot = Some(path.to_string());
+    }
+}
+
+pub(crate) fn forget_world() {
+    if let Ok(mut slot) = ACTIVE_WORLD.lock() {
+        *slot = None;
+    }
+}
+
 pub(crate) fn world_path() -> Option<String> {
+    if let Ok(slot) = ACTIVE_WORLD.lock() {
+        if let Some(path) = slot.as_ref() {
+            if std::path::Path::new(path).is_file() {
+                return Some(path.clone());
+            }
+        }
+    }
     if let Some(p) = std::env::var("SHOGO_WORLD").ok().filter(|p| !p.is_empty()) {
         if std::path::Path::new(&p).is_file() {
             return Some(p);
@@ -269,15 +327,18 @@ fn model_path() -> Option<String> {
 
 /// Load either a world (`SHOGO_WORLD`) or a character model (`SHOGO_MODEL`).
 fn load_asset(
-    commands: Commands,
+    mut commands: Commands,
     meshes: ResMut<Assets<Mesh>>,
     materials: ResMut<Assets<StandardMaterial>>,
     images: ResMut<Assets<Image>>,
     players: Query<(&mut Player, &mut Transform)>,
     orbit_q: Query<&mut Orbit>,
 ) {
+    // A new mission boots from SHOGO_WORLD or Ambush, not the previous exit.
+    forget_world();
     if let Some(path) = world_path() {
-        load_world(path, commands, meshes, materials, images, players);
+        commands.insert_resource(CampaignFile(path.clone()));
+        load_world(path, None, commands, meshes, materials, images, players);
     } else {
         load_model(commands, meshes, materials, orbit_q);
     }
@@ -344,6 +405,14 @@ fn load_model(
         MeshMaterial3d(materials.add(material)),
         Transform::default(),
     ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 9_000.0,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.6, 0.0)),
+    ));
 
     // Frame the orbit camera on the model: center the target on the model's
     // (Y-up) centroid and place the camera far enough back to see it all.
@@ -362,12 +431,14 @@ fn load_model(
 /// Load a retail `.DAT` world and spawn one mesh per texture.
 fn load_world(
     path: String,
+    spawn_name: Option<String>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut players: Query<(&mut Player, &mut Transform)>,
 ) {
+    remember_world(&path);
     let data = match std::fs::read(&path) {
         Ok(d) => d,
         Err(e) => {
@@ -455,18 +526,21 @@ fn load_world(
             }),
             perceptual_roughness: 1.0,
             metallic: 0.0,
-            unlit: true,
+            reflectance: 0.0,
+            unlit: false,
             double_sided: true,
             cull_mode: None,
             ..default()
         };
         commands.spawn((
+            LevelEntity,
             Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(materials.add(material)),
             Transform::default(),
         ));
     }
     info!("bound {textured}/{} textures", world.groups.len());
+    spawn_dat_lights(&mut commands, &data);
 
     let mut tris = Vec::new();
     for group in &world.groups {
@@ -488,22 +562,28 @@ fn load_world(
     let ntris = tris.len();
     let collider = collide::Collider::from_tris(tris);
 
-    // World positions are Y-up. start1 is 64 units above Road1.
-    let (spawn, face) = shogo_assets::dat::start_points(&data)
-        .ok()
-        .and_then(|s| s.into_iter().next())
+    // World positions are Y-up. A named start (the exit's StartPointName) wins.
+    let starts = shogo_assets::dat::start_points(&data).unwrap_or_default();
+    let chosen = spawn_name.as_deref().and_then(|want| {
+        starts
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(want))
+    });
+    let chosen = chosen.or(starts.first());
+    let (spawn, face, pitch) = chosen
         .map(|s| {
             let feet = world_pos(s.pos);
             let y = collider
                 .floor_y(feet.x, feet.z, feet.y + 128.0)
                 .map(|fy| fy + BODY)
                 .unwrap_or(feet.y);
-            (Vec3::new(feet.x, y, feet.z), 0.0)
+            let (yaw, pitch) = facing(s.rot);
+            (Vec3::new(feet.x, y, feet.z), yaw, pitch)
         })
         .unwrap_or_else(|| {
             let min = world_pos(world.min);
             let max = world_pos(world.max);
-            ((min + max) * 0.5 + Vec3::Y * 80.0, 0.0)
+            ((min + max) * 0.5 + Vec3::Y * 80.0, 0.0, 0.0)
         });
     commands.insert_resource(WorldCollide(collider));
     commands.insert_resource(Checkpoint {
@@ -512,8 +592,11 @@ fn load_world(
     });
     for (mut player, mut tf) in &mut players {
         player.yaw = face;
+        player.pitch = pitch;
+        player.vel = Vec3::ZERO;
         player.grounded = true;
         tf.translation = spawn;
+        tf.rotation = Quat::from_euler(EulerRot::YXZ, face, pitch, 0.0);
     }
     spawn_sky(
         &mut commands,
@@ -542,7 +625,7 @@ struct SkyRoot;
 #[derive(Component)]
 struct SkyCam;
 
-fn is_sky_portal(name: &str) -> bool {
+pub(crate) fn is_sky_portal(name: &str) -> bool {
     name.rsplit(['\\', '/'])
         .next()
         .unwrap_or(name)
@@ -575,6 +658,158 @@ fn follow_sky(
     }
 }
 
+/// PCF shadows from the level's own lights. Cascades cover a few dozen body
+/// lengths; the engine default of 150 units would stop at the player's feet.
+fn spawn_dat_lights(commands: &mut Commands, data: &[u8]) {
+    let lights = shogo_assets::dat::read_lights(data).unwrap_or_default();
+    let cascades: bevy::light::CascadeShadowConfig = bevy::light::CascadeShadowConfigBuilder {
+        num_cascades: 3,
+        minimum_distance: 1.0,
+        first_cascade_far_bound: 280.0,
+        maximum_distance: 2400.0,
+        overlap_proportion: 0.2,
+    }
+    .into();
+    let mut suns: Vec<_> = lights
+        .iter()
+        .filter(|light| light.kind == shogo_assets::dat::LightKind::Directional)
+        .collect();
+    let mut spots: Vec<_> = lights
+        .iter()
+        .filter(|light| light.kind == shogo_assets::dat::LightKind::Spot && light.radius >= 200.0)
+        .collect();
+    let mut points: Vec<_> = lights
+        .iter()
+        .filter(|light| light.kind == shogo_assets::dat::LightKind::Point && light.radius >= 500.0)
+        .collect();
+    spots.sort_by(|a, b| b.radius.total_cmp(&a.radius));
+    points.sort_by(|a, b| b.radius.total_cmp(&a.radius));
+    spots.truncate(12);
+    points.truncate(6);
+    if suns.is_empty() && spots.is_empty() && points.is_empty() {
+        commands.spawn((
+            LevelEntity,
+            DirectionalLight {
+                illuminance: 9_000.0,
+                shadow_maps_enabled: true,
+                ..default()
+            },
+            cascades,
+            Transform::from_rotation(Quat::from_rotation_arc(
+                Vec3::NEG_Z,
+                Vec3::new(-0.35, -0.85, -0.4).normalize(),
+            )),
+        ));
+        return;
+    }
+    let spot_shadow = suns.is_empty();
+    for (i, light) in suns.drain(..).enumerate() {
+        let dir = sun_direction(light);
+        commands.spawn((
+            LevelEntity,
+            DirectionalLight {
+                color: light_color(light.color),
+                illuminance: 9_000.0 * light.bright.clamp(0.15, 4.0),
+                shadow_maps_enabled: i == 0,
+                ..default()
+            },
+            cascades.clone(),
+            aim(Vec3::ZERO, dir),
+        ));
+    }
+    for (i, light) in spots.iter().enumerate() {
+        let range = light.radius.max(80.0);
+        let outer = (light.fov_deg * 0.5).to_radians().clamp(0.08, std::f32::consts::FRAC_PI_2 - 0.02);
+        commands.spawn((
+            LevelEntity,
+            SpotLight {
+                color: light_color(light.color),
+                intensity: 8.0e5 * light.bright.clamp(0.2, 4.0),
+                range,
+                radius: 0.0,
+                shadow_maps_enabled: spot_shadow && i == 0,
+                outer_angle: outer,
+                inner_angle: outer * 0.75,
+                ..default()
+            },
+            aim(world_pos(light.pos), spot_direction(light)),
+        ));
+    }
+    for light in points {
+        let range = light.radius.max(80.0);
+        commands.spawn((
+            LevelEntity,
+            PointLight {
+                color: light_color(light.color),
+                intensity: light.bright.clamp(0.2, 4.0) * range * range * 0.35,
+                range,
+                radius: 0.0,
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            Transform::from_translation(world_pos(light.pos)),
+        ));
+    }
+}
+
+fn light_color(c: [f32; 3]) -> Color {
+    Color::linear_rgb(c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0))
+}
+
+fn rotation_is_identity(q: [f32; 4]) -> bool {
+    q[0].abs() < 1.0e-4 && q[1].abs() < 1.0e-4 && q[2].abs() < 1.0e-4 && (q[3] - 1.0).abs() < 1.0e-3
+}
+
+/// +Z through the engine's transposed quaternion. Identity is +Z.
+fn lith_forward(q: [f32; 4]) -> Vec3 {
+    let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+    let len2 = x * x + y * y + z * z + w * w;
+    if len2 < 1.0e-8 {
+        return Vec3::Z;
+    }
+    let s = 2.0 / len2;
+    Vec3::new(
+        s * (x * z - w * y),
+        s * (y * z + w * x),
+        1.0 - s * (x * x + y * y),
+    )
+}
+
+fn sun_direction(light: &shogo_assets::dat::LevelLight) -> Vec3 {
+    let pos = world_pos(light.pos);
+    if rotation_is_identity(light.rotation) && pos.length() > 1_000.0 {
+        return -pos.normalize_or_zero();
+    }
+    let dir = lith_forward(light.rotation);
+    if dir.length_squared() < 1.0e-6 {
+        Vec3::new(-0.3, -0.8, -0.4).normalize()
+    } else {
+        dir.normalize()
+    }
+}
+
+fn spot_direction(light: &shogo_assets::dat::LevelLight) -> Vec3 {
+    if rotation_is_identity(light.rotation) {
+        return Vec3::NEG_Y;
+    }
+    let dir = lith_forward(light.rotation);
+    if dir.length_squared() < 1.0e-6 {
+        Vec3::NEG_Y
+    } else {
+        dir.normalize()
+    }
+}
+
+fn aim(pos: Vec3, dir: Vec3) -> Transform {
+    let dir = if dir.length_squared() < 1.0e-6 {
+        Vec3::NEG_Y
+    } else {
+        dir.normalize()
+    };
+    let up = if dir.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
+    Transform::from_translation(pos).looking_to(dir, up)
+}
+
 fn spawn_sky(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -593,6 +828,7 @@ fn spawn_sky(
         return;
     };
     commands.spawn((
+        LevelEntity,
         SkyCam,
         Camera3d::default(),
         Camera {
@@ -610,6 +846,7 @@ fn spawn_sky(
         RenderLayers::layer(1),
     ));
     commands.spawn((
+        LevelEntity,
         SkyRoot,
         Visibility::default(),
         RenderLayers::layer(1),
@@ -979,10 +1216,140 @@ fn orbit_camera(
     }
 }
 
+/// LithTech `Rotation` is a vector. Empty retail starts stay at the origin facing.
+/// A component past one full turn is degrees; anything smaller is already radians.
+fn facing(rot: [f32; 3]) -> (f32, f32) {
+    let scale = if rot.iter().any(|c| c.abs() > std::f32::consts::TAU) {
+        std::f32::consts::PI / 180.0
+    } else {
+        1.0
+    };
+    (rot[1] * scale, rot[0] * scale)
+}
+
+fn dat_stem(name: &str) -> &str {
+    let name = name.trim();
+    if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".dat") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
+/// `02_Quarters` matches `02_QUARTERS.DAT` in the same `WORLDS` directory.
+pub(crate) fn resolve_next_world(current: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let dir = current.parent()?;
+    let want = dat_stem(name);
+    if want.is_empty() {
+        return None;
+    }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.eq_ignore_ascii_case(want) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn queue_transition(event: On<script::LevelTransitionEvent>, mut commands: Commands) {
+    let Some(current) = world_path() else {
+        return;
+    };
+    let Some(path) = resolve_next_world(std::path::Path::new(&current), &event.next_world) else {
+        warn!("no world file for {}", event.next_world);
+        return;
+    };
+    info!("exit to {} at {}", path.display(), event.spawn_point);
+    commands.insert_resource(PendingTransition {
+        path: path.to_string_lossy().into_owned(),
+        spawn: event.spawn_point.clone(),
+    });
+}
+
+fn reload_campaign(
+    campaign: Option<Res<CampaignFile>>,
+    spawn: Option<Res<SpawnRequest>>,
+    mut commands: Commands,
+    meshes: ResMut<Assets<Mesh>>,
+    materials: ResMut<Assets<StandardMaterial>>,
+    images: ResMut<Assets<Image>>,
+    players: Query<(&mut Player, &mut Transform)>,
+) {
+    let Some(path) = campaign.map(|file| file.0.clone()).or_else(world_path) else {
+        return;
+    };
+    let name = spawn.map(|request| request.0.clone());
+    commands.remove_resource::<SpawnRequest>();
+    load_world(path, name, commands, meshes, materials, images, players);
+}
+
+fn perform_transition(world: &mut World) {
+    let Some(pending) = world.remove_resource::<PendingTransition>() else {
+        return;
+    };
+    let ids = {
+        let mut query = world.query_filtered::<Entity, With<LevelEntity>>();
+        query.iter(world).collect::<Vec<_>>()
+    };
+    for id in ids {
+        world.despawn(id);
+    }
+    world.remove_resource::<script::Script>();
+    world.remove_resource::<script::ObjectiveState>();
+    world.remove_resource::<waypoint::Guide>();
+    world.remove_resource::<combat::Waves>();
+    world.remove_resource::<combat::Roster>();
+    world.remove_resource::<combat::Mission>();
+    world.remove_resource::<nav::WalkNav>();
+    world.remove_resource::<WorldCollide>();
+    world.remove_resource::<Checkpoint>();
+    world.insert_resource(CampaignFile(pending.path.clone()));
+    world.insert_resource(SpawnRequest(pending.spawn.clone()));
+    remember_world(&pending.path);
+    info!("loading {} at {}", pending.path, pending.spawn);
+    if let Err(err) = world.run_system_once(reload_campaign) {
+        error!("level reload failed: {err}");
+        return;
+    }
+    if let Err(err) = world.run_system_once(arena::assemble) {
+        error!("arena rebuild failed: {err}");
+    }
+    if let Err(err) = world.run_system_once(combat::spawn_cast) {
+        error!("cast reload failed: {err}");
+    }
+    if let Err(err) = world.run_system_once(script::place) {
+        error!("script reload failed: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{rotate_toward, BodyTune, BODY, GRAVITY, JUMP, RUN, WALK};
     use bevy::prelude::Vec3;
+
+    #[test]
+    fn quarters_exit_resolves_to_the_retail_dat() {
+        let current = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../extracted/SHOGO/WORLDS/01_AMBUSH.DAT");
+        let next = super::resolve_next_world(&current, "02_Quarters").expect("quarters dat");
+        let file = next.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(file.eq_ignore_ascii_case("02_QUARTERS.DAT"));
+        let data = std::fs::read(&next).unwrap();
+        let starts = shogo_assets::dat::start_points(&data).unwrap();
+        let start = starts
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case("start1"))
+            .expect("start1");
+        assert!((start.pos[0] + 80.0).abs() < 0.1);
+        assert!((start.pos[2] - 1088.0).abs() < 0.1);
+    }
 
     #[test]
     fn on_foot_matches_the_old_walk_and_mca_is_heavier() {

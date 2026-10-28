@@ -12,8 +12,8 @@ use crate::collide::Collider;
 use crate::input::Actions;
 use crate::nav::WalkNav;
 use crate::{
-    find_asset_root, load_dtx, resolve_ci, world_path, Checkpoint, Player, WorldCollide, BODY,
-    MAG_SIZE, PLAYER_HP, RESERVE_SIZE,
+    find_asset_root, load_dtx, resolve_ci, world_path, Checkpoint, LevelEntity, Player, WorldCollide,
+    BODY, MAG_SIZE, PLAYER_HP, RESERVE_SIZE,
 };
 
 const ASSAULT_DAMAGE: f32 = 15.0;
@@ -173,6 +173,14 @@ impl EnemyKind {
     fn from_u8(v: u8) -> Self {
         KINDS.get(v as usize).copied().unwrap_or(Self::Trooper)
     }
+
+    /// Retail MCA bodies live under `MODELS/ENEMIES/MCA`. Ruin stays on-foot.
+    pub(crate) fn is_mech(self) -> bool {
+        matches!(
+            self,
+            Self::Andra5 | Self::Andra10 | Self::Raksha | Self::Uhlan
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -320,6 +328,125 @@ impl Waves {
         self.index = 0;
         self.calm = 0.6;
     }
+}
+
+/// Cast, props, and the wave director for the current world. Guns and the HUD
+/// stay on the player, so a level change calls this without `spawn_fight`.
+pub(crate) fn spawn_cast(
+    mut commands: Commands,
+    collide: Option<Res<WorldCollide>>,
+    checkpoint: Option<Res<Checkpoint>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let (Some(collide), Some(checkpoint)) = (collide, checkpoint) else {
+        return;
+    };
+    let root = world_path().and_then(|p| find_asset_root(std::path::Path::new(&p)));
+    deploy_cast(
+        &mut commands,
+        &collide,
+        &checkpoint,
+        root.as_deref(),
+        meshes.as_mut(),
+        materials.as_mut(),
+        images.as_mut(),
+    );
+}
+
+fn deploy_cast(
+    commands: &mut Commands,
+    collide: &WorldCollide,
+    checkpoint: &Checkpoint,
+    root: Option<&std::path::Path>,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) {
+    let mut mesh = Vec::with_capacity(DEFS.len());
+    let mut mat = Vec::with_capacity(DEFS.len());
+    for def in &DEFS {
+        let model = load_abc(root, def.model);
+        mesh.push(meshes.add(match &model {
+            Some(model) => character_mesh(model, def.height),
+            None => Mesh::from(Cuboid::new(def.body_radius * 2.0, def.height, def.body_radius)),
+        }));
+        let skin = root
+            .and_then(|r| load_dtx(r, def.skin))
+            .map(|image| images.add(image));
+        mat.push(materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: skin,
+            unlit: true,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        }));
+        info!(
+            "{} prefab ({})",
+            def.name,
+            if model.is_some() { "abc" } else { "fallback" }
+        );
+    }
+    let roster = Roster { mesh, mat };
+    let mission = world_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|data| shogo_assets::dat::level_actors(&data).ok())
+        .unwrap_or_default();
+    let scripted = mission.iter().any(|actor| actor.class.contains('_'));
+    if scripted {
+        let cast = place_mission(
+            commands,
+            &collide.0,
+            root,
+            &mission,
+            checkpoint.pos,
+            meshes,
+            materials,
+            images,
+        );
+        let hostiles = cast.iter().filter(|m| !m.ally).count();
+        let allies = cast.len() - hostiles;
+        info!("mission cast {hostiles} hostiles, {allies} allies");
+        commands.insert_resource(Mission { cast });
+        commands.insert_resource(Waves {
+            index: 0,
+            queue: Vec::new(),
+            timer: 0.0,
+            calm: 0.0,
+            anchors: Vec::new(),
+            cursor: 0,
+            spawned: 0,
+            scripted: true,
+        });
+    } else {
+        let anchors = anchors(&collide.0, checkpoint.pos);
+        info!("wave anchors {}", anchors.len());
+        const OPENING: [u8; 6] = [0, 1, 2, 3, 4, 0];
+        let opening = anchors.len().min(OPENING.len());
+        for (slot, pos) in anchors.iter().take(opening).enumerate() {
+            spawn_enemy(
+                commands,
+                &roster,
+                EnemyKind::from_u8(OPENING[slot]),
+                *pos,
+                checkpoint.pos,
+            );
+        }
+        info!("opening squad {opening}");
+        commands.insert_resource(Waves {
+            index: 1,
+            queue: Vec::new(),
+            timer: 0.0,
+            calm: 2.5,
+            anchors,
+            cursor: 0,
+            spawned: 0,
+            scripted: false,
+        });
+    }
+    commands.insert_resource(roster);
 }
 
 pub(crate) fn spawn_fight(
@@ -478,90 +605,15 @@ pub(crate) fn spawn_fight(
         ));
     });
 
-    let mut mesh = Vec::with_capacity(DEFS.len());
-    let mut mat = Vec::with_capacity(DEFS.len());
-    for def in &DEFS {
-        let model = load_abc(root.as_deref(), def.model);
-        mesh.push(meshes.add(match &model {
-            Some(model) => character_mesh(model, def.height),
-            None => Mesh::from(Cuboid::new(def.body_radius * 2.0, def.height, def.body_radius)),
-        }));
-        let skin = root
-            .as_deref()
-            .and_then(|r| load_dtx(r, def.skin))
-            .map(|image| images.add(image));
-        mat.push(materials.add(StandardMaterial {
-            base_color: Color::WHITE,
-            base_color_texture: skin,
-            unlit: true,
-            double_sided: true,
-            cull_mode: None,
-            ..default()
-        }));
-        info!(
-            "{} prefab ({})",
-            def.name,
-            if model.is_some() { "abc" } else { "fallback" }
-        );
-    }
-    let roster = Roster { mesh, mat };
-    let mission = world_path()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|data| shogo_assets::dat::level_actors(&data).ok())
-        .unwrap_or_default();
-    let scripted = mission.iter().any(|actor| actor.class.contains('_'));
-    if scripted {
-        let cast = place_mission(
-            &mut commands,
-            &collide.0,
-            root.as_deref(),
-            &mission,
-            checkpoint.pos,
-            &mut meshes,
-            &mut materials,
-            images.as_mut(),
-        );
-        let hostiles = cast.iter().filter(|m| !m.ally).count();
-        let allies = cast.len() - hostiles;
-        info!("mission cast {hostiles} hostiles, {allies} allies");
-        commands.insert_resource(Mission { cast });
-        commands.insert_resource(Waves {
-            index: 0,
-            queue: Vec::new(),
-            timer: 0.0,
-            calm: 0.0,
-            anchors: Vec::new(),
-            cursor: 0,
-            spawned: 0,
-            scripted: true,
-        });
-    } else {
-        let anchors = anchors(&collide.0, checkpoint.pos);
-        info!("wave anchors {}", anchors.len());
-        const OPENING: [u8; 6] = [0, 1, 2, 3, 4, 0];
-        let opening = anchors.len().min(OPENING.len());
-        for (slot, pos) in anchors.iter().take(opening).enumerate() {
-            spawn_enemy(
-                &mut commands,
-                &roster,
-                EnemyKind::from_u8(OPENING[slot]),
-                *pos,
-                checkpoint.pos,
-            );
-        }
-        info!("opening squad {opening}");
-        commands.insert_resource(Waves {
-            index: 1,
-            queue: Vec::new(),
-            timer: 0.0,
-            calm: 2.5,
-            anchors,
-            cursor: 0,
-            spawned: 0,
-            scripted: false,
-        });
-    }
-    commands.insert_resource(roster);
+    deploy_cast(
+        &mut commands,
+        &collide,
+        &checkpoint,
+        root.as_deref(),
+        &mut meshes,
+        &mut materials,
+        images.as_mut(),
+    );
 
     let square = load_abc(root.as_deref(), "MODELS/1X1_SQUARE.ABC");
     let flash_mesh = meshes.add(match &square {
@@ -593,7 +645,8 @@ pub(crate) fn spawn_fight(
         pulse: pulse_flash,
         bolt_mesh: meshes.add(Cuboid::new(3.5, 22.0, 3.5)),
         bolt_mat: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.45, 0.85, 1.0),
+            base_color: Color::linear_rgba(0.55, 2.2, 3.6, 1.0),
+            emissive: LinearRgba::new(0.35, 1.8, 3.2, 1.0),
             unlit: true,
             alpha_mode: AlphaMode::Add,
             ..default()
@@ -695,6 +748,7 @@ fn spawn_unit(
     let center = def.height * 0.5;
     commands
         .spawn((
+            LevelEntity,
             Enemy {
                 kind,
                 ally,
@@ -832,6 +886,7 @@ fn place_mission(
                 .map(|fy| Vec3::new(authored.x, fy, authored.z))
                 .unwrap_or(authored);
             commands.spawn((
+                LevelEntity,
                 crate::script::ScriptProp(actor.name.clone()),
                 Mesh3d(mesh),
                 MeshMaterial3d(mat),
@@ -1027,19 +1082,25 @@ pub(crate) fn weapons(
             }
         }
         if let Some(entity) = door_hit {
-            if let Ok((_, mut door, _)) = doors.get_mut(entity) {
+            if let Ok((_, mut door, dtf)) = doors.get_mut(entity) {
                 if crate::script::harm(&mut door, damage) {
+                    let at = dtf.translation;
+                    commands.trigger(crate::door_audio::BarricadeBroke { at });
                     commands.entity(entity).despawn();
                 }
             }
         } else if let Some(entity) = best {
-            if let Ok((_, mut enemy, _)) = enemies.get_mut(entity) {
-                kill_or_hurt(&mut enemy, damage);
+            if let Ok((_, mut enemy, etf)) = enemies.get_mut(entity) {
+                let center = etf.translation;
+                if kill_or_hurt(&mut enemy, damage) {
+                    report_hit(&mut commands, &enemy, entity, origin, dir, best_t, center);
+                }
             }
         }
     } else if dir.length_squared() > 0.5 {
         let rot = Quat::from_rotation_arc(Vec3::Y, dir);
         commands.spawn((
+            LevelEntity,
             Bolt {
                 dir,
                 damage,
@@ -1104,8 +1165,10 @@ pub(crate) fn bolts(
             }
         }
         if let Some(hit) = door_hit {
-            if let Ok((_, mut door, _)) = doors.get_mut(hit) {
+            if let Ok((_, mut door, dtf)) = doors.get_mut(hit) {
                 if crate::script::harm(&mut door, bolt.damage) {
+                    let at = dtf.translation;
+                    commands.trigger(crate::door_audio::BarricadeBroke { at });
                     commands.entity(hit).despawn();
                 }
             }
@@ -1114,10 +1177,15 @@ pub(crate) fn bolts(
             continue;
         }
         if let Some(hit) = best {
-            if let Ok((_, mut enemy, _)) = enemies.get_mut(hit) {
-                kill_or_hurt(&mut enemy, bolt.damage);
+            let dir = bolt.dir;
+            let damage = bolt.damage;
+            if let Ok((_, mut enemy, etf)) = enemies.get_mut(hit) {
+                let center = etf.translation;
+                if kill_or_hurt(&mut enemy, damage) {
+                    report_hit(&mut commands, &enemy, hit, origin, dir, best_t, center);
+                }
             }
-            spawn_world_flash(&mut commands, &flashes, origin + bolt.dir * best_t, 28.0, 0.12);
+            spawn_world_flash(&mut commands, &flashes, origin + dir * best_t, 28.0, 0.12);
             commands.entity(entity).despawn();
             continue;
         }
@@ -1130,9 +1198,9 @@ pub(crate) fn bolts(
     }
 }
 
-fn kill_or_hurt(enemy: &mut Enemy, damage: f32) {
+fn kill_or_hurt(enemy: &mut Enemy, damage: f32) -> bool {
     if !enemy.alive || enemy.ally {
-        return;
+        return false;
     }
     enemy.health = (enemy.health - damage).max(0.0);
     if enemy.health <= 0.0 {
@@ -1141,6 +1209,29 @@ fn kill_or_hurt(enemy: &mut Enemy, damage: f32) {
         enemy.dead_t = 0.0;
         enemy.fall_v = 80.0;
     }
+    true
+}
+
+fn report_hit(
+    commands: &mut Commands,
+    enemy: &Enemy,
+    target: Entity,
+    origin: Vec3,
+    dir: Vec3,
+    t: f32,
+    center: Vec3,
+) {
+    let impact_point = origin + dir * t;
+    let mut normal = impact_point - center;
+    if normal.length_squared() < 1e-4 {
+        normal = -dir;
+    }
+    commands.trigger(crate::feedback::EntityHitEvent {
+        target,
+        impact_point,
+        normal: normal.normalize_or_zero(),
+        is_mech: enemy.kind.is_mech(),
+    });
 }
 
 fn revive(
@@ -1617,6 +1708,7 @@ fn spawn_world_flash(commands: &mut Commands, bank: &MuzzleBank, pos: Vec3, scal
         return;
     };
     commands.spawn((
+        LevelEntity,
         MuzzleFlash {
             life,
             duration: life,
@@ -1649,6 +1741,7 @@ fn spawn_shot_beam(
     let mid = from + dir * (len * 0.5);
     let rot = Quat::from_rotation_arc(Vec3::Y, dir);
     commands.spawn((
+        LevelEntity,
         ShotBeam { life: 0.14 },
         Mesh3d(meshes.add(Cuboid::new(1.4, len, 1.4))),
         MeshMaterial3d(materials.add(StandardMaterial {
