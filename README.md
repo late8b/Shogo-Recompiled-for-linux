@@ -21,8 +21,8 @@ asset-format specs, recovered C++ class names).
 | DAT world objects/properties | **Done** — grammar verified; cast, triggers, keys, and doors come from the object list |
 | DAT world geometry | **Done** — v56 WorldBSP on all 60 worlds; native decoder plus `ltdat.py` / `dat2glb.py` |
 | Ghidra decompilation | **Reference only** — 6,455 functions in `decompiled/`; not a rebuilt executable |
-| Mission script | **Slice** — trigger volumes, objectives, patrol keys, keyframers, breakable doors, sliding doors, level change |
-| Full campaign | Ambush → Quarters is played. Later exits use the same loader. Door panels are cuboids. The HUD prints objective and transmission ids. Retail physics is still in the dump |
+| Mission script | **Running** — the loaded DAT's trigger volumes, objectives, patrol keys, keyframers, barricades, sliding doors, and a level change |
+| Full campaign | Ambush → Quarters (`02_QUARTERS.DAT`, Calm Before the Storm) at `start1` has been walked. Later exits use the same loader; Quarters → `03_MCA_Dock` has not. Doors draw named WorldModel brushes; a missing brush keeps collision and draws nothing. Transmissions show retail text; objectives stay `Objective {id}`. Continue from the menu still boots Ambush. The save applies only when its mission name matches that world. Retail physics is still in the dump |
 
 ## Repository layout
 
@@ -84,8 +84,10 @@ WGPU_BACKEND=vulkan cargo run -p shogo-viewer
 
 The window opens on the original menu. **New Game** plays the Shinara District
 bumper, then starts **The Ambush** at the authored `start1` point. **Continue**
-reloads `~/.local/share/shogo-mad/continue.sav` and skips the bumper. **Esc**
-pauses. **F5** quicksaves.
+reads `~/.local/share/shogo-mad/continue.sav`, skips the bumper, and still
+starts Ambush. Saved position, health, ammo, and weapon apply only when that
+file's mission name matches the world that booted. **Esc** pauses. **F5**
+quicksaves.
 
 On foot: mouse or right stick looks, WASD or the left stick moves, Shift or L3
 sprints, Space or Cross jumps, left click or R2 fires, right click or L2 aims,
@@ -105,10 +107,18 @@ SHOGO_GRAB=0        # leave the mouse free
 SHOGO_SAVE=/tmp/continue.sav
 ```
 
-Build notes (see `rust/Cargo.toml`): Bevy is built with `default-features =
+Build notes (see `rust/Cargo.toml`): Bevy 0.20 is built with `default-features =
 false` plus an explicit feature list so it needs **no system dev headers**.
 `bevy_audio` stays off (that needs ALSA headers). Music is the retail WAVs
-played through `paplay`. Windowing is X11. UI uses `bevy_ui` / `bevy_text`.
+played through `paplay`. A sliding door plays `OpenStartSound` or
+`CloseStartSound` as it starts to open or close (fallbacks
+`SOUND/DOORS/DOOROPEN1.WAV` and `DOORCLOSE.WAV`). A barricade break plays
+`DestroySound` or `SOUND/PROPS/CRATE.WAV`. Windowing is X11. UI uses
+`bevy_ui` / `bevy_text`. The camera uses PCF `ShadowFilteringMethod::Hardware2x2`
+and `Bloom::OLD_SCHOOL` (intensity 0.05). When the DAT has lights, those light
+the level. One directional casts the shadow map, or the largest spot if the
+world has no sun. A distant identity sun aims at the origin. A `DirLight`
+with no rotation aims down.
 
 ```bash
 cd rust
@@ -137,9 +147,10 @@ Full detail in `docs/FINDINGS.md`.
   figure stands in one mesh.
 - **SPR** — just a path pointer to a DTX.
 - **DAT** — DEdit world (v56): object/entity list (spawns, lights, triggers
-  with Pos/Rotation, doors with MoveDist/MoveDir/StateFlags), then WorldBSP
-  (points, surfaces with OPQ UVs, polygons). `shogo-assets` `read_mission`
-  reads triggers, AI keys, keyframers, and doors. `tools/ltdat.py`,
+  with Pos/Rotation, doors with MoveDist/MoveDir/StateFlags), then the root
+  WorldBSP (points, surfaces with OPQ UVs, polygons) and the named WorldModels
+  after it. `shogo-assets` `read_mission` reads triggers, AI keys, keyframers,
+  and doors; `world_models` reads those brushes. `tools/ltdat.py`,
   `tools/dat2glb.py`.
 
 ## Goals / roadmap
@@ -153,13 +164,25 @@ Full detail in `docs/FINDINGS.md`.
 4. **Gameplay rewrite** — mission 1 is playable (menu, bumper, authored cast,
    two weapons, on-foot/MCA, one continue file). The same loop runs the DAT
    mission graph: trigger volumes, objective ids, `FollowPath` on AI keys,
-   keyframers, breakable barricades, and sliding doors. An unlocked exit
-   despawns the current level and loads the next `.DAT` in that `WORLDS`
-   folder, keeping the player's health, ammo, and weapon. Ambush's exit has
-   been walked into **Calm Before the Storm** (`02_QUARTERS.DAT`, the hangar)
-   at `start1`. Door panels are cuboids. The HUD still prints `Objective {id}`
-   and `Transmission {StringID}`. Continue from the menu still boots Ambush.
-   The retail physics octree is still only in the decompiler output.
+   keyframers, breakable barricades, and sliding doors. Those doors and
+   barricades draw the named WorldModel brush. A missing brush keeps collision
+   and draws nothing. An unlocked exit emits one transition, despawns the
+   current level, and loads the next `.DAT` in that `WORLDS` folder, keeping
+   the player's health, ammo, and weapon. Ambush's `outtahere` has been walked
+   into **Calm Before the Storm** (`02_QUARTERS.DAT`) at `start1`. Quarters'
+   exits name `03_MCA_Dock` at `start1` and use the same loader; that hop has
+   not been walked. A HUD line shaped like `Transmission {id}` shows the retail
+   string from `embedded/mod0_credits.dll`. Objective lines still print
+   `Objective {id}` (Ambush 1040 is "Fall back to Drop Point Renegade" in that
+   table). When the active objective has a walkable exit or touch trigger, the
+   HUD marks it with a screen-space diamond, or an edge chevron when it is off
+   screen, plus meters. Ambush 1040 marks `outtahere` at (−2304, 160, 2624).
+   A landed rifle ray or pulse bolt flashes a cloned material, flinches the
+   body after its yaw, and bursts infantry quads or mech tetrahedrons and
+   cuboids. Mechs are Andra, Raksha, and Uhlan. Ruin is on foot. Continue from
+   the menu still boots Ambush. Saved health, ammo, weapon, and position apply
+   only when the save's mission name matches the world just loaded. The retail
+   physics octree is still only in the decompiler output.
 
 ## Licensing note
 
