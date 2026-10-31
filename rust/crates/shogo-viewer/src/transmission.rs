@@ -1,4 +1,4 @@
-//! Transmission HUD copy from the retail shell string table.
+//! Transmission and objective HUD copy from the retail shell string table.
 
 use std::path::{Path, PathBuf};
 
@@ -6,7 +6,7 @@ use bevy::prelude::*;
 use shogo_assets::StringTable;
 
 /// Loaded once at startup. An empty table means the DLL was missing; the HUD
-/// then keeps `Transmission {id}` so the miss stays visible.
+/// then keeps `Transmission {id}` and `Objective {id}` so the miss stays visible.
 #[derive(Resource, Clone)]
 pub(crate) struct Dialogue {
     table: StringTable,
@@ -19,24 +19,30 @@ impl Dialogue {
             .and_then(|bytes| StringTable::parse(&bytes).ok())
             .unwrap_or_default();
         if table.is_empty() {
-            warn!("dialogue string table missing; transmissions stay numeric");
+            warn!("dialogue string table missing; transmissions and objectives stay numeric");
         }
         Self { table }
     }
 
-    /// Resolve a script line. Only `Transmission {id}` is rewritten. Objective
-    /// lines and status text pass through.
+    /// Resolve a script line. `Transmission {id}` and `Objective {id}` become
+    /// retail copy. A missing id stays in that form. Other lines pass through.
     pub(crate) fn line(&self, raw: &str) -> String {
-        let Some(id) = raw
-            .strip_prefix("Transmission ")
-            .and_then(|rest| rest.parse::<i32>().ok())
-        else {
-            return raw.to_string();
-        };
-        match self.table.get(id) {
-            Some(text) if !text.is_empty() => text.to_string(),
-            _ => format!("Transmission {id}"),
+        if let Some(text) = self.lookup(raw, "Transmission ") {
+            return text;
         }
+        if let Some(text) = self.lookup(raw, "Objective ") {
+            return text;
+        }
+        raw.to_string()
+    }
+
+    fn lookup(&self, raw: &str, prefix: &str) -> Option<String> {
+        let id = raw.strip_prefix(prefix)?.parse::<i32>().ok()?;
+        let label = prefix.trim_end();
+        Some(match self.table.get(id) {
+            Some(text) if !text.is_empty() => text.to_string(),
+            _ => format!("{label} {id}"),
+        })
     }
 }
 
@@ -81,7 +87,19 @@ mod tests {
             "Recon 4, fall back to Drop Point Renegade for immediate evac. We're picking up Fallen reinforcements approaching from the southeast. Get your team clear ASAP. Over."
         );
         assert_eq!(dialogue.line("Transmission 999999"), "Transmission 999999");
-        assert_eq!(dialogue.line("Objective 1040"), "Objective 1040");
         assert_eq!(dialogue.line("The way out is locked"), "The way out is locked");
+    }
+
+    #[test]
+    fn objective_1040_shows_the_retail_sentence() {
+        let dialogue = Dialogue::load();
+        if dialogue.table.is_empty() {
+            return;
+        }
+        assert_eq!(
+            dialogue.line("Objective 1040"),
+            "Fall back to Drop Point Renegade"
+        );
+        assert_eq!(dialogue.line("Objective 999999"), "Objective 999999");
     }
 }
