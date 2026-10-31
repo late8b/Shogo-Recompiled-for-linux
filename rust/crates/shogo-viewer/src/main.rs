@@ -28,6 +28,7 @@
 mod arena;
 mod collide;
 mod combat;
+mod depart;
 mod door_audio;
 mod feedback;
 mod front;
@@ -156,6 +157,9 @@ pub(crate) struct Player {
     pub(crate) reserve: [u16; 2],
     /// Seconds left on a reload. 0 means the gun is ready.
     pub(crate) reloading: f32,
+    /// View kick in radians. Added on top of `pitch` and decayed, so the aim
+    /// point itself does not walk upward.
+    pub(crate) recoil: f32,
 }
 
 /// Geometry, cast, triggers, and props that belong to the loaded world.
@@ -197,11 +201,17 @@ pub(crate) struct Checkpoint {
 #[derive(Resource)]
 pub(crate) struct LookGrabbed(bool);
 
-const WALK: f32 = 280.0;
-const RUN: f32 = 560.0;
-const GRAVITY: f32 = 1600.0;
-const JUMP: f32 = 420.0;
+/// Unshifted infantry speed, inches per second. LithTech's published run
+/// default is 400; 300/480 is a jog and a sprint, not a creep and not a slide.
+const WALK: f32 = 300.0;
+const RUN: f32 = 480.0;
+/// `DEFAULT_WORLD_GRAVITY` in the LithTech client shell, inches per second squared.
+const GRAVITY: f32 = 2_000.0;
+/// LithTech `m_fJumpVel` default. Hang time is `2 * jump / gravity`.
+const JUMP: f32 = 550.0;
 pub(crate) const BODY: f32 = 32.0;
+/// Look limit. 1.55 rad is about 89 degrees, enough to track a dropship.
+const PITCH_LIMIT: f32 = 1.55;
 /// Larger than every enemy health pool in the roster.
 pub(crate) const PLAYER_HP: f32 = 500.0;
 pub(crate) const MAG_SIZE: [u16; 2] = [30, 8];
@@ -234,7 +244,19 @@ pub(crate) struct BodyTune {
     pub yaw_rate: f32,
     pub jump: f32,
     pub gravity: f32,
+    /// Bevy's vertical field of view. Retail on-foot is 90° across a 4:3 frame.
     pub fov: f32,
+    /// Inches from the collision-sphere center up to the eyes.
+    pub eye: f32,
+    /// Tallest curb the body will step onto, in inches.
+    pub step: f32,
+}
+
+/// Horizontal degrees to Bevy's vertical fov on a 4:3 frame.
+/// `2 * atan(tan(h/2) * 3/4)`.
+fn retail_vertical_fov(horizontal_deg: f32) -> f32 {
+    let half = (horizontal_deg * 0.5).to_radians();
+    2.0 * (half.tan() * 0.75).atan()
 }
 
 impl BodyTune {
@@ -246,14 +268,21 @@ impl BodyTune {
         let lerp = |a: f32, b: f32| a + (b - a) * t;
         Self {
             radius: lerp(BODY, 108.0),
-            walk: lerp(WALK, 460.0),
-            sprint: lerp(RUN, 920.0),
-            accel: lerp(14_000.0, 520.0),
-            brake: lerp(14_000.0, 260.0),
-            yaw_rate: lerp(18.0, 0.9),
-            jump: lerp(JUMP, 860.0),
-            gravity: lerp(GRAVITY, 1_050.0),
-            fov: lerp(75.0_f32.to_radians(), 98.0_f32.to_radians()),
+            walk: lerp(WALK, 640.0),
+            sprint: lerp(RUN, 900.0),
+            // On-foot reaches a sprint in 0.12s and stops in 0.10s
+            // (`SlideToStopTime`). The mech takes about 0.38s and 0.32s.
+            accel: lerp(4_000.0, 2_400.0),
+            brake: lerp(4_800.0, 2_800.0),
+            yaw_rate: lerp(18.0, 4.0),
+            jump: lerp(JUMP, 780.0),
+            gravity: lerp(GRAVITY, 1_600.0),
+            // 90° and 100° across 4:3, stored as Bevy's vertical angle.
+            fov: lerp(retail_vertical_fov(90.0), retail_vertical_fov(100.0)),
+            // Sanjuro's posed mesh is about 73 inches. Eyes sit at the top of
+            // the 64-inch sphere (32 + 32). The mech's eyes are about 15 feet up.
+            eye: lerp(32.0, 72.0),
+            step: lerp(18.0, 36.0),
         }
     }
 }
@@ -283,8 +312,9 @@ fn spawn_stage(mut commands: Commands) {
         bevy::light::ShadowFilteringMethod::Hardware2x2,
         bevy::post_process::bloom::Bloom::OLD_SCHOOL,
         AmbientLight {
-            color: Color::WHITE,
-            brightness: 180.0,
+            // A white fill this high flattens the cyan DAT lights into a wash.
+            color: Color::srgb(0.82, 0.88, 0.92),
+            brightness: 80.0,
             affects_lightmapped_meshes: true,
         },
         Player {
@@ -304,6 +334,7 @@ fn spawn_stage(mut commands: Commands) {
             ammo: MAG_SIZE,
             reserve: RESERVE_SIZE,
             reloading: 0.0,
+            recoil: 0.0,
         },
     ));
 }
@@ -571,7 +602,12 @@ fn load_world(
         ));
     }
     info!("bound {textured}/{} textures", world.groups.len());
-    spawn_dat_lights(&mut commands, &data);
+    spawn_dat_lights(
+        &mut commands,
+        &data,
+        world_pos(world.min),
+        world_pos(world.max),
+    );
 
     let mut tris = Vec::new();
     for group in &world.groups {
@@ -611,7 +647,7 @@ fn load_world(
             .find(|s| s.name.eq_ignore_ascii_case(want))
     });
     let chosen = chosen.or(starts.first());
-    let (spawn, face, pitch) = chosen
+    let (feet, floor, face, pitch) = chosen
         .map(|s| {
             let feet = world_pos(s.pos);
             let floor = if let Some(grid) = physics.as_ref() {
@@ -619,14 +655,13 @@ fn load_world(
             } else {
                 collider.floor_y(feet.x, feet.z, feet.y + 128.0)
             };
-            let y = floor.map(|fy| fy + BODY).unwrap_or(feet.y);
             let (yaw, pitch) = facing(s.rot);
-            (Vec3::new(feet.x, y, feet.z), yaw, pitch)
+            (feet, floor, yaw, pitch)
         })
         .unwrap_or_else(|| {
             let min = world_pos(world.min);
             let max = world_pos(world.max);
-            ((min + max) * 0.5 + Vec3::Y * 80.0, 0.0, 0.0)
+            ((min + max) * 0.5, None, 0.0, 0.0)
         });
     commands.insert_resource(WorldCollide(collider));
     if let Some(grid) = physics {
@@ -634,18 +669,28 @@ fn load_world(
     } else {
         commands.remove_resource::<WorldPhysics>();
     }
-    commands.insert_resource(Checkpoint {
-        pos: spawn,
-        yaw: face,
-    });
+    // Continue overwrites scale from the save after this load. A fresh boot
+    // stays on foot; Ambush is the street extraction, not the mech.
+    let mut spawn = feet + Vec3::Y * 80.0;
     for (mut player, mut tf) in &mut players {
+        let tune = BodyTune::at(player.scale);
+        player.radius = tune.radius;
+        let y = floor
+            .map(|fy| fy + tune.radius + tune.eye)
+            .unwrap_or(feet.y);
+        spawn = Vec3::new(feet.x, y, feet.z);
         player.yaw = face;
         player.pitch = pitch;
         player.vel = Vec3::ZERO;
         player.grounded = true;
+        player.recoil = 0.0;
         tf.translation = spawn;
         tf.rotation = Quat::from_euler(EulerRot::YXZ, face, pitch, 0.0);
     }
+    commands.insert_resource(Checkpoint {
+        pos: spawn,
+        yaw: face,
+    });
     spawn_sky(
         &mut commands,
         meshes.as_mut(),
@@ -737,8 +782,9 @@ fn follow_sky(
 
 /// PCF shadows from the level's own lights. Cascades cover a few dozen body
 /// lengths; the engine default of 150 units would stop at the player's feet.
-fn spawn_dat_lights(commands: &mut Commands, data: &[u8]) {
+fn spawn_dat_lights(commands: &mut Commands, data: &[u8], min: Vec3, max: Vec3) {
     let lights = shogo_assets::dat::read_lights(data).unwrap_or_default();
+    let focus = Vec3::new((min.x + max.x) * 0.5, 0.0, (min.z + max.z) * 0.5);
     let cascades: bevy::light::CascadeShadowConfig = bevy::light::CascadeShadowConfigBuilder {
         num_cascades: 3,
         minimum_distance: 1.0,
@@ -762,7 +808,10 @@ fn spawn_dat_lights(commands: &mut Commands, data: &[u8]) {
     spots.sort_by(|a, b| b.radius.total_cmp(&a.radius));
     points.sort_by(|a, b| b.radius.total_cmp(&a.radius));
     spots.truncate(12);
-    points.truncate(6);
+    // Ambush's play-surface lights are the smaller "lowdown" points. Keeping
+    // only the six widest lights drops every one of those and leaves the canyon
+    // on the sun plus a white ambient.
+    points.truncate(32);
     if suns.is_empty() && spots.is_empty() && points.is_empty() {
         commands.spawn((
             LevelEntity,
@@ -781,12 +830,12 @@ fn spawn_dat_lights(commands: &mut Commands, data: &[u8]) {
     }
     let spot_shadow = suns.is_empty();
     for (i, light) in suns.drain(..).enumerate() {
-        let dir = sun_direction(light);
+        let dir = sun_direction(light, focus);
         commands.spawn((
             LevelEntity,
             DirectionalLight {
                 color: light_color(light.color),
-                illuminance: 9_000.0 * light.bright.clamp(0.15, 4.0),
+                illuminance: 12_000.0 * light.bright.clamp(0.15, 4.0),
                 shadow_maps_enabled: i == 0,
                 ..default()
             },
@@ -814,11 +863,16 @@ fn spawn_dat_lights(commands: &mut Commands, data: &[u8]) {
     }
     for light in points {
         let range = light.radius.max(80.0);
+        // Bevy divides lumens by 4π before the inverse square. A 1500-inch
+        // street light should still be a pool at a couple hundred inches, and
+        // a 6000-inch fill must not become a second sun, so the reach used for
+        // the lumen count is capped.
+        let reach = range.min(1_600.0);
         commands.spawn((
             LevelEntity,
             PointLight {
                 color: light_color(light.color),
-                intensity: light.bright.clamp(0.2, 4.0) * range * range * 0.35,
+                intensity: light.bright.clamp(0.2, 4.0) * reach * reach * 12.0,
                 range,
                 radius: 0.0,
                 shadow_maps_enabled: false,
@@ -852,10 +906,20 @@ fn lith_forward(q: [f32; 4]) -> Vec3 {
     )
 }
 
-fn sun_direction(light: &shogo_assets::dat::LevelLight) -> Vec3 {
+fn sun_direction(light: &shogo_assets::dat::LevelLight, focus: Vec3) -> Vec3 {
     let pos = world_pos(light.pos);
-    if rotation_is_identity(light.rotation) && pos.length() > 1_000.0 {
-        return -pos.normalize_or_zero();
+    if rotation_is_identity(light.rotation) {
+        // Identity has no authored aim. Shining at the world origin from a
+        // marker beside the volume skims the streets. Fall from the marker
+        // toward the level, and keep the ray dropping when the marker is low.
+        let mut to = focus - pos;
+        let horizontal = Vec2::new(to.x, to.z).length();
+        if to.y > -horizontal * 0.45 {
+            to.y = -horizontal * 0.65;
+        }
+        if to.length_squared() > 1.0 {
+            return to.normalize();
+        }
     }
     let dir = lith_forward(light.rotation);
     if dir.length_squared() < 1.0e-6 {
@@ -1061,6 +1125,7 @@ fn player_move(
     let dt = time.delta_secs().min(0.05);
 
     for (mut player, mut tf, mut proj) in &mut players {
+        let eye_before = BodyTune::at(player.scale).eye;
         player.scale_lock = (player.scale_lock - dt).max(0.0);
         if actions.toggle_scale && player.scale_lock <= 0.0 && player.health > 0.0 {
             player.want_mca = !player.want_mca;
@@ -1091,7 +1156,7 @@ fn player_move(
 
         let look_scale = 1.0 - 0.45 * player.ads;
         player.yaw -= actions.look.x * look_scale;
-        player.pitch = (player.pitch + actions.look.y * look_scale).clamp(-1.45, 1.45);
+        player.pitch = (player.pitch + actions.look.y * look_scale).clamp(-PITCH_LIMIT, PITCH_LIMIT);
 
         // Modern console aim-assist / auto-lock snapping when aiming (right click / L2)
         if actions.aim && player.health > 0.0 {
@@ -1129,7 +1194,7 @@ fn player_move(
 
             if let Some(target_dir) = best_target_dir {
                 let target_yaw = (-target_dir.x).atan2(-target_dir.z);
-                let target_pitch = target_dir.y.asin().clamp(-1.45, 1.45);
+                let target_pitch = target_dir.y.asin().clamp(-PITCH_LIMIT, PITCH_LIMIT);
                 let snap_rate = dt * 12.0; // snappy console snap
                 // Smoothly slerp yaw/pitch toward target
                 let mut dyaw = target_yaw - player.yaw;
@@ -1140,7 +1205,13 @@ fn player_move(
             }
         }
 
-        tf.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0);
+        player.pitch = player.pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        player.recoil *= (-dt / 0.07).exp();
+        if player.recoil < 0.0008 {
+            player.recoil = 0.0;
+        }
+        let view_pitch = (player.pitch + player.recoil).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        tf.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, view_pitch, 0.0);
 
         let fwd = tf.forward();
         let flat = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
@@ -1152,16 +1223,15 @@ fn player_move(
         let ads_slow = 1.0 - 0.4 * player.ads;
         let speed = if actions.sprint { tune.sprint } else { tune.walk } * mag * ads_slow;
 
-        if player.scale <= 0.001 {
-            player.vel.x = dir.x * speed;
-            player.vel.z = dir.z * speed;
-        } else if mag < 0.05 {
-            let stopped = approach_v(Vec3::new(player.vel.x, 0.0, player.vel.z), Vec3::ZERO, tune.brake * dt);
+        let current = Vec3::new(player.vel.x, 0.0, player.vel.z);
+        if mag < 0.05 {
+            let stopped = approach_v(current, Vec3::ZERO, tune.brake * dt);
             player.vel.x = stopped.x;
             player.vel.z = stopped.z;
         } else {
-            let current = Vec3::new(player.vel.x, 0.0, player.vel.z);
-            if current.length() > 80.0 {
+            // Infantry changes direction with the stick. Capping that turn
+            // leaves the old velocity and the body skates. The mech still yaws.
+            if player.scale > 0.5 && current.length() > 80.0 {
                 dir = rotate_toward(current.normalize_or_zero(), dir, tune.yaw_rate * dt);
             }
             let steered = approach_v(current, dir * speed, tune.accel * dt);
@@ -1180,7 +1250,18 @@ fn player_move(
         } else {
             player.vel.y -= tune.gravity * dt;
         }
-        let next = tf.translation + player.vel * dt;
+        let body = tf.translation - Vec3::Y * eye_before;
+        let mut next = body + player.vel * dt;
+        if player.grounded && player.vel.y <= 0.0 && dir.length_squared() > 0.1 {
+            next = raise_step(
+                next,
+                dir,
+                tune.radius,
+                tune.step,
+                physics.as_deref(),
+                collide.as_deref(),
+            );
+        }
         let (mut center, mut grounded) = if let Some(grid) = physics.as_ref() {
             grid.0.depenetrate(next, player.radius)
         } else {
@@ -1211,7 +1292,7 @@ fn player_move(
                 player_floor(physics.as_deref(), collide.as_deref(), center.x, center.z, center.y + 4.0)
             {
                 let gap = center.y - player.radius - fy;
-                if (-0.5..24.0).contains(&gap) {
+                if (-0.5..tune.step).contains(&gap) {
                     center.y = fy + player.radius;
                     player.vel.y = 0.0;
                     grounded = true;
@@ -1231,7 +1312,7 @@ fn player_move(
             }
         }
         if center.is_finite() {
-            tf.translation = center;
+            tf.translation = center + Vec3::Y * tune.eye;
         }
         player.grounded = grounded;
     }
@@ -1249,6 +1330,28 @@ fn player_floor(
         grid.0.floor_y(x, z, max_y)
     } else {
         collide.and_then(|walls| walls.0.floor_y(x, z, max_y))
+    }
+}
+
+/// Lift onto a curb in front of the body. A sphere against a vertical riser
+/// otherwise stops dead on a step a person would walk up.
+fn raise_step(
+    next: Vec3,
+    dir: Vec3,
+    radius: f32,
+    step: f32,
+    physics: Option<&WorldPhysics>,
+    collide: Option<&WorldCollide>,
+) -> Vec3 {
+    let ahead = next + dir * (radius * 0.45);
+    let Some(fy) = player_floor(physics, collide, ahead.x, ahead.z, next.y + step) else {
+        return next;
+    };
+    let rise = fy + radius - next.y;
+    if (1.0..=step).contains(&rise) {
+        Vec3::new(next.x, fy + radius + 0.5, next.z)
+    } else {
+        next
     }
 }
 
@@ -1455,8 +1558,8 @@ fn perform_transition(world: &mut World) {
 #[cfg(test)]
 mod tests {
     use super::{
-        carried_rounds, rotate_toward, sky_camera_parts, BodyTune, BODY, GRAVITY, JUMP, MAG_SIZE,
-        RESERVE_SIZE, RUN, WALK,
+        carried_rounds, retail_vertical_fov, rotate_toward, sky_camera_parts, sun_direction,
+        BodyTune, BODY, GRAVITY, JUMP, MAG_SIZE, RESERVE_SIZE, RUN, WALK,
     };
     use bevy::camera::ClearColorConfig;
     use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -1570,12 +1673,19 @@ mod tests {
         assert!((foot.sprint - RUN).abs() < 1e-3);
         assert!((foot.jump - JUMP).abs() < 1e-3);
         assert!((foot.gravity - GRAVITY).abs() < 1e-3);
+        assert!((foot.eye - 32.0).abs() < 1e-3);
+        assert!((foot.fov - retail_vertical_fov(90.0)).abs() < 1e-4);
+        assert!(foot.fov < 80.0_f32.to_radians());
+        assert!(foot.brake > foot.sprint * 4.0, "on-foot stop");
         assert!(mca.radius > foot.radius * 2.0);
         assert!(mca.sprint > foot.sprint);
-        assert!(mca.accel < foot.accel * 0.1);
-        assert!(mca.yaw_rate < 1.2);
+        assert!(mca.accel < foot.accel);
+        assert!(mca.accel > 2_000.0, "mech still crawls up to speed");
+        assert!(mca.brake > mca.sprint * 2.0, "mech still ice-skates");
+        assert!(mca.yaw_rate > 3.0 && mca.yaw_rate < foot.yaw_rate);
         assert!(mca.jump > foot.jump);
         assert!(mca.fov > foot.fov);
+        assert!(mca.eye > foot.eye * 2.0);
         let mid = BodyTune::at(0.5);
         assert!(mid.radius > foot.radius && mid.radius < mca.radius);
     }
@@ -1588,5 +1698,24 @@ mod tests {
         let ang = turned.z.atan2(turned.x) - from.z.atan2(from.x);
         assert!(ang.abs() < 0.25, "{ang}");
         assert!(turned.length() > 0.9);
+    }
+
+    #[test]
+    fn identity_sun_falls_onto_the_level_instead_of_the_origin() {
+        let light = shogo_assets::dat::LevelLight {
+            kind: shogo_assets::dat::LightKind::Directional,
+            name: "sun".into(),
+            pos: [-8448.0, 6400.0, -6080.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            color: [1.0, 1.0, 1.0],
+            bright: 1.0,
+            radius: 90.0,
+            fov_deg: 90.0,
+        };
+        let focus = Vec3::new(0.0, 0.0, 1280.0);
+        let dir = sun_direction(&light, focus);
+        let toward_origin = -Vec3::new(light.pos[0], light.pos[1], light.pos[2]).normalize();
+        assert!(dir.y < -0.4, "sun must fall, got {dir:?}");
+        assert!(dir.z > toward_origin.z, "aim follows the level, not the origin");
     }
 }

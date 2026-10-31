@@ -94,6 +94,10 @@ pub(crate) struct Machine {
     exit_start: String,
     exit_sent: bool,
     finished: bool,
+    /// The dropship locked the exit after opening it. The countdown hides.
+    ship_gone: bool,
+    /// The player has overlapped the exit. The countdown hides.
+    reached_drop: bool,
     places: Vec<(String, [f32; 3])>,
     door_orders: Vec<(String, DoorVerb)>,
 }
@@ -158,6 +162,8 @@ impl Machine {
             exit_start: String::new(),
             exit_sent: false,
             finished: false,
+            ship_gone: false,
+            reached_drop: false,
             places: Vec::new(),
             door_orders: Vec::new(),
         };
@@ -213,6 +219,56 @@ impl Machine {
         (&self.objectives, &self.done)
     }
 
+    /// Seconds until the scripted dropship locks the exit, while 1040 is the
+    /// live objective. `None` once the player has reached the drop, 1040 is
+    /// finished, the ship has left, or the mission has already transitioned.
+    pub(crate) fn extraction_remaining(&self) -> Option<f32> {
+        if self.ship_gone || self.finished || self.reached_drop {
+            return None;
+        }
+        let current = self
+            .objectives
+            .iter()
+            .find(|id| !self.done.contains(id))?;
+        if *current != crate::depart::EXTRACTION_OBJECTIVE {
+            return None;
+        }
+        self.departure_eta()
+    }
+
+    fn departure_eta(&self) -> Option<f32> {
+        let mut schedule = crate::depart::Schedule::new();
+        for node in &self.nodes {
+            schedule.node(
+                node.class,
+                &node.name,
+                node.send_delay,
+                node.locked,
+                node.spent,
+                node.messages
+                    .iter()
+                    .map(|message| (message.target.clone(), message.body.clone()))
+                    .collect(),
+            );
+        }
+        for item in &self.pending {
+            schedule.pending(item.time, &item.target, &item.body);
+        }
+        for frame in &self.framers {
+            schedule.framer(
+                &frame.name,
+                frame.active,
+                frame.cursor,
+                frame.wait,
+                frame.keys.clone(),
+            );
+        }
+        for key in &self.keys {
+            schedule.key(key.time, &key.target, &key.message);
+        }
+        crate::depart::departure_eta(&schedule)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finished(&self) -> Option<(&str, &str)> {
         self.finished
@@ -245,10 +301,19 @@ impl Machine {
                 target.to_string(),
                 if lock { DoorVerb::Lock } else { DoorVerb::Unlock },
             ));
+            let mut leaving = false;
             for node in &mut self.nodes {
                 if same(node.name.as_str(), target) {
+                    // A lock on an exit that is open is the dropship departing.
+                    // The exit starts locked, so the initial state is not a leave.
+                    if node.class == NodeClass::Exit && lock && !node.locked {
+                        leaving = true;
+                    }
                     node.locked = lock;
                 }
+            }
+            if leaving {
+                self.ship_gone = true;
             }
             return;
         }
@@ -399,11 +464,18 @@ impl Machine {
     fn touch_player(&mut self, player: [f32; 3]) {
         let mut fire = Vec::new();
         let mut locked_exit = false;
+        let mut reached = false;
         for (i, node) in self.nodes.iter().enumerate() {
-            if node.spent || !overlaps(player, node.pos, node.dims) {
+            if !overlaps(player, node.pos, node.dims) {
                 continue;
             }
             let exit = node.class == NodeClass::Exit && node.player;
+            if exit {
+                reached = true;
+            }
+            if node.spent {
+                continue;
+            }
             let touch = node.touch && node.player;
             if node.locked && exit {
                 locked_exit = true;
@@ -412,6 +484,9 @@ impl Machine {
             if exit || touch {
                 fire.push(i);
             }
+        }
+        if reached {
+            self.reached_drop = true;
         }
         for id in fire {
             self.fire_node(id);
@@ -628,6 +703,10 @@ impl Script {
     pub(crate) fn line(&self) -> &str {
         self.machine.line()
     }
+
+    pub(crate) fn depart_left(&self) -> Option<f32> {
+        self.machine.extraction_remaining()
+    }
 }
 
 #[derive(Component)]
@@ -641,6 +720,10 @@ pub(crate) struct Barricade {
 
 #[derive(Component)]
 pub(crate) struct MissionReadout;
+
+/// Remaining time until the dropship leaves. Sits under the objective line.
+#[derive(Component)]
+pub(crate) struct DepartReadout;
 
 const DOOR_HALF: Vec3 = Vec3::new(72.0, 96.0, 36.0);
 
@@ -854,33 +937,72 @@ pub(crate) fn readout(
     dialogue: Res<crate::transmission::Dialogue>,
     script: Option<Res<Script>>,
     mut commands: Commands,
-    mut lines: Query<&mut Text, With<MissionReadout>>,
+    mut lines: Query<&mut Text, (With<MissionReadout>, Without<DepartReadout>)>,
+    mut clocks: Query<(&mut Text, &mut Node), (With<DepartReadout>, Without<MissionReadout>)>,
 ) {
     let Some(script) = script else {
         return;
     };
     let line = dialogue.line(script.line());
+    let clock = script.depart_left().map(crate::depart::format_depart);
     if lines.is_empty() {
-        commands.spawn((
-            LevelEntity,
-            MissionReadout,
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(28.0),
-                top: Val::Px(28.0),
-                ..default()
-            },
-            Text::new(line),
-            TextFont {
-                font_size: FontSize::Px(22.0),
-                ..default()
-            },
-            TextColor(Color::srgb(0.96, 0.93, 0.84)),
-        ));
+        commands
+            .spawn((
+                LevelEntity,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Vw(2.2),
+                    top: Val::Vh(3.9),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::FlexStart,
+                    row_gap: Val::Vh(0.4),
+                    ..default()
+                },
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    MissionReadout,
+                    Text::new(line),
+                    TextFont {
+                        font_size: FontSize::Vh(3.05),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.96, 0.93, 0.84)),
+                ));
+                parent.spawn((
+                    DepartReadout,
+                    Node {
+                        display: if clock.is_some() {
+                            Display::Flex
+                        } else {
+                            Display::None
+                        },
+                        ..default()
+                    },
+                    Text::new(clock.unwrap_or_default()),
+                    TextFont {
+                        font_size: FontSize::Vh(3.05),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.76, 0.32)),
+                ));
+            });
         return;
     }
     if let Ok(mut text) = lines.single_mut() {
         *text = Text::new(line);
+    }
+    if let Ok((mut text, mut node)) = clocks.single_mut() {
+        match clock {
+            Some(label) => {
+                node.display = Display::Flex;
+                *text = Text::new(label);
+            }
+            None => {
+                node.display = Display::None;
+                *text = Text::new("");
+            }
+        }
     }
 }
 
@@ -900,7 +1022,12 @@ pub(crate) fn touch_volumes(
     };
     for (_ent, mut volume, tf) in &mut volumes {
         let was = volume.occupied;
-        volume.occupied = sphere_hits(ptf.translation, body.radius, tf.translation, volume.half);
+        volume.occupied = sphere_hits(
+            ptf.translation - Vec3::Y * crate::BodyTune::at(body.scale).eye,
+            body.radius,
+            tf.translation,
+            volume.half,
+        );
         let armed = volume.player && (volume.touch || volume.class == NodeClass::Exit);
         if volume.occupied && !was && armed {
             if let Some(script) = script.as_mut() {
@@ -927,7 +1054,7 @@ pub(crate) fn doors(
     tune: Res<crate::tune::Mixer>,
     cues: Option<Res<crate::door_audio::DoorCues>>,
     mut script: Option<ResMut<Script>>,
-    players: Query<&Transform, With<Player>>,
+    players: Query<(&Player, &Transform)>,
     mut doors: Query<(&mut SlidingDoor, &mut Transform), Without<Player>>,
 ) {
     let dt = time.delta_secs().min(0.05);
@@ -935,7 +1062,9 @@ pub(crate) fn doors(
         .as_mut()
         .map(|script| script.machine.take_door_orders())
         .unwrap_or_default();
-    let player = players.single().ok().map(|tf| tf.translation);
+    let player = players.single().ok().map(|(body, tf)| {
+        tf.translation - Vec3::Y * crate::BodyTune::at(body.scale).eye
+    });
     for (mut door, mut tf) in &mut doors {
         let was = door.phase;
         for (name, verb) in &orders {
@@ -1514,5 +1643,82 @@ mod tests {
         assert!((wave(2, 1.0) - 1.0).abs() < 1e-4);
         assert!(sphere_hits(Vec3::new(10.0, 0.0, 0.0), 8.0, Vec3::ZERO, Vec3::splat(16.0)));
         assert!(!sphere_hits(Vec3::new(40.0, 0.0, 0.0), 8.0, Vec3::ZERO, Vec3::splat(16.0)));
+    }
+
+    #[test]
+    fn ambush_extraction_counts_down() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../extracted/SHOGO/WORLDS/01_AMBUSH.DAT");
+        if !path.exists() {
+            return;
+        }
+        let data = std::fs::read(path).unwrap();
+        let mission = shogo_assets::dat::read_mission(&data).unwrap();
+        let mut machine = Machine::boot(mission);
+        let start_pos = [3072.0, 64.0, 2688.0];
+        let exit_pos = [-2304.0, 160.0, 2624.0];
+        machine.tick(0.05, start_pos, &[]);
+        let start = machine
+            .extraction_remaining()
+            .expect("extraction countdown");
+        // trans1 14 + rescue 50 + flight 18 + pad wait 30.
+        assert!(
+            (start - 112.0).abs() < 1.0,
+            "countdown {start} is not the authored 112s leave"
+        );
+        assert_eq!(crate::depart::format_depart(45.0), "0:45");
+        assert_eq!(crate::depart::format_depart(112.0), "1:52");
+        assert_eq!(crate::depart::format_depart(0.0), "0:00");
+        machine.tick(1.0, start_pos, &[]);
+        let later = machine.extraction_remaining().expect("still counting");
+        assert!(
+            (start - later - 1.0).abs() < 0.05,
+            "{start} -> {later} did not drop by one second"
+        );
+
+        let mut boarded = machine.clone();
+        boarded.tick(0.05, exit_pos, &[]);
+        assert!(boarded.extraction_remaining().is_none());
+        boarded.tick(0.05, start_pos, &[]);
+        assert!(
+            boarded.extraction_remaining().is_none(),
+            "reaching the drop point must clear the countdown"
+        );
+        assert!(boarded.finished().is_none());
+
+        let mut done = machine.clone();
+        done.deliver("obj2", "Trigger");
+        assert!(done.objectives().1.contains(&1040));
+        assert!(done.extraction_remaining().is_none());
+        assert!(done.finished().is_none());
+
+        let mut prev = later;
+        let mut t = 1.05;
+        loop {
+            for _ in 0..20 {
+                machine.tick(0.05, start_pos, &[]);
+                t += 0.05;
+            }
+            match machine.extraction_remaining() {
+                Some(now) => {
+                    assert!(now < prev, "{prev} -> {now} at {t}");
+                    prev = now;
+                }
+                None => break,
+            }
+            if t > 130.0 {
+                panic!("countdown outlived the ship leave");
+            }
+        }
+        assert!(
+            machine.finished().is_none(),
+            "the ship locking the exit must not start a level transition"
+        );
+        assert!(machine.objectives().0.contains(&1040));
+        assert!(!machine.objectives().1.contains(&1040));
+        assert!(
+            (100.0..120.0).contains(&t),
+            "ship left at {t}, authored leave is 112s"
+        );
     }
 }

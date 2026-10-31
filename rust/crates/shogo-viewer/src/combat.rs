@@ -17,11 +17,17 @@ use crate::{
 };
 
 const ASSAULT_DAMAGE: f32 = 15.0;
-const ASSAULT_COOLDOWN: f32 = 0.14;
+/// The assault muzzle case in the client shell stores `0.1` seconds.
+const ASSAULT_COOLDOWN: f32 = 0.10;
 const PULSE_DAMAGE: f32 = 40.0;
-const PULSE_COOLDOWN: f32 = 0.5;
+const PULSE_COOLDOWN: f32 = 0.40;
 const PULSE_SPEED: f32 = 3_200.0;
 const RELOAD_TIME: [f32; 2] = [1.25, 1.7];
+/// Desired viewmodel thickness in inches. The posed rifle is about 4.7 across
+/// and 13 long, already in Y-up, so this scale sits it in the lower right
+/// instead of through the near plane.
+const VIEW_GIRTH: f32 = 10.0;
+const VIEW_HOLD: Vec3 = Vec3::new(12.0, -8.5, -24.0);
 
 const MARKSMAN_LO: f32 = 96.0;
 const MARKSMAN_HI: f32 = 128.0;
@@ -222,7 +228,10 @@ pub(crate) struct Enemy {
 }
 
 #[derive(Component)]
-pub(crate) struct ViewGun(pub(crate) u8);
+pub(crate) struct ViewGun {
+    slot: u8,
+    phase: f32,
+}
 
 #[derive(Component)]
 pub(crate) struct HealthPip(pub(crate) u8);
@@ -478,7 +487,7 @@ pub(crate) fn spawn_fight(
         Color::srgb(0.25, 0.55, 0.85),
         images.as_mut(),
     );
-    let hold = Vec3::new(0.38, -0.30, -1.2);
+    let hold = VIEW_HOLD;
     commands.entity(player).with_children(|parent| {
         parent.spawn(gun_bundle(
             &mut meshes,
@@ -941,6 +950,7 @@ fn faction_skin(class: &str, model_rel: &str) -> Option<String> {
 pub(crate) fn weapons(
     time: Res<Time>,
     actions: Res<Actions>,
+    tune: Res<crate::tune::Mixer>,
     mut commands: Commands,
     collide: Option<Res<WorldCollide>>,
     flashes: Option<Res<MuzzleBank>>,
@@ -948,8 +958,10 @@ pub(crate) fn weapons(
     mut rng: Option<ResMut<ShotRng>>,
     mut waves: Option<ResMut<Waves>>,
     mission: Option<Res<Mission>>,
-    mut players: Query<(Entity, &mut Player, &mut Transform), Without<Enemy>>,
-    mut guns: Query<(&ViewGun, &mut Visibility), Without<Enemy>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut players: Query<(Entity, &mut Player, &mut Transform), (Without<Enemy>, Without<ViewGun>)>,
+    mut guns: Query<(&mut ViewGun, &mut Visibility, &mut Transform), (Without<Enemy>, Without<Player>)>,
     mut enemies: Query<(Entity, &mut Enemy, &Transform), (Without<Player>, Without<ViewGun>)>,
     mut doors: Query<(Entity, &mut crate::script::Barricade, &Transform), (Without<Enemy>, Without<Player>)>,
 ) {
@@ -973,12 +985,15 @@ pub(crate) fn weapons(
         player.weapon = (player.weapon + 1) % 2;
         player.reloading = 0.0;
     }
-    for (gun, mut vis) in &mut guns {
-        *vis = if gun.0 == player.weapon {
+    for (mut gun, mut vis, mut gtf) in &mut guns {
+        *vis = if gun.slot == player.weapon {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
+        if gun.slot == player.weapon {
+            pose_viewgun(&mut gun, &mut gtf, &player, dt);
+        }
     }
 
     {
@@ -1041,6 +1056,10 @@ pub(crate) fn weapons(
         )
     };
     player.fire_cd = cooldown;
+    player.recoil = (player.recoil + if player.weapon == 0 { 0.012 } else { 0.028 }).min(0.07);
+    if player.weapon == 0 {
+        tune.sting(&weapon_sound("WEAPONS/ASSAULTRIFLE/FIRE.WAV"));
+    }
     player.ammo[slot] = player.ammo[slot].saturating_sub(1);
     if player.ammo[slot] == 0 && can_reload(player.weapon, player.ammo, player.reserve) {
         player.reloading = RELOAD_TIME[slot];
@@ -1094,6 +1113,21 @@ pub(crate) fn weapons(
                     report_hit(&mut commands, &enemy, entity, origin, dir, best_t, center);
                 }
             }
+        }
+        // A short streak from the muzzle, not a line to the impact. Hit flash
+        // and flinch still come from `report_hit`.
+        let streak = (best_t - 28.0).clamp(0.0, 72.0);
+        if streak >= 16.0 {
+            spawn_shot_beam(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                origin + dir * 24.0,
+                dir,
+                streak,
+                0.05,
+                0.55,
+            );
         }
     } else if dir.length_squared() > 0.5 {
         let rot = Quat::from_rotation_arc(Vec3::Y, dir);
@@ -1251,8 +1285,10 @@ fn revive(
     player.grounded = true;
     player.yaw = checkpoint.yaw;
     player.pitch = 0.0;
-    let floor = checkpoint.pos.y - BODY;
-    tf.translation = Vec3::new(checkpoint.pos.x, floor + player.radius, checkpoint.pos.z);
+    player.recoil = 0.0;
+    let tune = crate::BodyTune::at(player.scale);
+    let feet = checkpoint.pos.y - tune.radius - tune.eye;
+    tf.translation = Vec3::new(checkpoint.pos.x, feet + tune.radius + tune.eye, checkpoint.pos.z);
     tf.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0);
     for (entity, _, _) in enemies.iter() {
         commands.entity(entity).despawn();
@@ -1497,7 +1533,16 @@ pub(crate) fn enemies(
                 let muzzle = pos + dir * (def.body_radius + 8.0) + Vec3::Y * (def.height * 0.15);
                 spawn_world_flash(&mut commands, &flashes, muzzle, def.height * 0.45, 0.2);
                 let show = (end_t - 64.0).clamp(36.0, 900.0);
-                spawn_shot_beam(&mut commands, &mut meshes, &mut materials, muzzle, aim, show);
+                spawn_shot_beam(
+                    &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    muzzle,
+                    aim,
+                    show,
+                    0.08,
+                    1.4,
+                );
             }
         }
 
@@ -1699,6 +1744,29 @@ pub(crate) fn muzzle_flashes(
     }
 }
 
+fn weapon_sound(rel: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../extracted/SOUND")
+        .join(rel)
+}
+
+fn pose_viewgun(gun: &mut ViewGun, tf: &mut Transform, player: &Player, dt: f32) {
+    let speed = Vec2::new(player.vel.x, player.vel.z).length();
+    let moving = player.grounded && speed > 30.0;
+    if moving {
+        gun.phase += dt * (7.0 + speed / 200.0);
+    }
+    let amp = if moving { 1.1 } else { 0.0 };
+    let bob = Vec3::new(
+        (gun.phase * 0.5).sin() * amp * 0.55,
+        gun.phase.sin().abs() * amp,
+        0.0,
+    );
+    let kick = Vec3::new(0.0, player.recoil * 18.0, player.recoil * 70.0);
+    let aimed = Vec3::new(4.0, -5.2, -22.0);
+    tf.translation = VIEW_HOLD.lerp(aimed, player.ads) + bob + kick;
+}
+
 fn spawn_view_flash(
     commands: &mut Commands,
     bank: &MuzzleBank,
@@ -1719,7 +1787,7 @@ fn spawn_view_flash(
             },
             Mesh3d(bank.mesh.clone()),
             MeshMaterial3d(first),
-            Transform::from_xyz(0.36, -0.20, -1.95).with_scale(Vec3::splat(1.05)),
+            Transform::from_xyz(13.5, -5.5, -40.0).with_scale(Vec3::splat(7.0)),
         ));
     });
 }
@@ -1751,9 +1819,11 @@ fn spawn_shot_beam(
     from: Vec3,
     aim: Vec3,
     end_t: f32,
+    life: f32,
+    thick: f32,
 ) {
     let len = end_t.max(0.0);
-    if len < 24.0 {
+    if len < 12.0 {
         return;
     }
     let dir = aim.normalize_or_zero();
@@ -1764,8 +1834,8 @@ fn spawn_shot_beam(
     let rot = Quat::from_rotation_arc(Vec3::Y, dir);
     commands.spawn((
         LevelEntity,
-        ShotBeam { life: 0.14 },
-        Mesh3d(meshes.add(Cuboid::new(1.4, len, 1.4))),
+        ShotBeam { life },
+        Mesh3d(meshes.add(Cuboid::new(thick, len, thick))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(1.0, 0.62, 0.15),
             unlit: true,
@@ -1791,7 +1861,7 @@ pub(crate) fn hud(
     };
     let fov = match proj {
         Projection::Perspective(p) => p.fov,
-        _ => 75.0_f32.to_radians(),
+        _ => 90.0_f32.to_radians(),
     };
     let aspect = windows
         .single()
@@ -2066,7 +2136,7 @@ fn gun_bundle(
     visibility: Visibility,
 ) -> impl Bundle {
     (
-        ViewGun(slot),
+        ViewGun { slot, phase: 0.0 },
         Mesh3d(meshes.add(gun.mesh)),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: if gun.skin.is_some() {
@@ -2120,12 +2190,20 @@ fn view_gun(
         skin,
         tint: fallback,
         rotation,
-        scale: 0.32 / girth.max(0.05),
+        scale: VIEW_GIRTH / girth.max(0.05),
     }
 }
 
 fn orient_view_mesh(model: &shogo_assets::AbcModel) -> (Mesh, Quat, f32) {
-    let mut pts: Vec<Vec3> = model.positions.iter().copied().map(lt_model).collect();
+    // The decoder's bind pose is already Y-up. Another Z-up flip stands the
+    // rifle on its barrel. The posed mesh is only ~13 inches and centered on
+    // the camera, so the hold offset and `VIEW_GIRTH` place it.
+    let mut pts: Vec<Vec3> = model
+        .positions
+        .iter()
+        .copied()
+        .map(|p| Vec3::new(p[0], p[1], p[2]))
+        .collect();
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
     for p in &pts {

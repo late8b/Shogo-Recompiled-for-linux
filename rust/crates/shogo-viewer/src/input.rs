@@ -22,6 +22,9 @@ pub const TRIGGER: f32 = 0.38;
 const YAW_RATE: f32 = 2.45;
 const PITCH_RATE: f32 = 1.85;
 const LOOK_TAU: f32 = 0.035;
+/// Radians per mouse pixel. 0.003 whipped the view; this is about one turn
+/// across two 1080p screen-widths.
+const MOUSE_LOOK: f32 = 0.0022;
 
 #[derive(Resource)]
 pub struct Actions {
@@ -114,8 +117,8 @@ pub fn gather(
     let mut look_y = 0.0;
     if locked {
         for ev in motion.read() {
-            look_x += ev.delta.x * 0.003;
-            look_y -= ev.delta.y * 0.003;
+            look_x += ev.delta.x * MOUSE_LOOK;
+            look_y -= ev.delta.y * MOUSE_LOOK;
         }
     } else {
         motion.clear();
