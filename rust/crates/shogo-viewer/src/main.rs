@@ -21,6 +21,7 @@
 //!           click, Enter, or Cross to respawn, Esc pauses
 //!
 //! The game opens on the menu. New Game plays the Ambush bumper, then mission 1.
+//! Continue skips the bumper and loads the mission named in the save.
 //! Esc pauses. F5 or the pause menu writes a continue file. SHOGO_SKIP_MENU=1
 //! boots straight into the mission.
 
@@ -34,6 +35,7 @@ mod script;
 mod input;
 mod nav;
 mod pad;
+mod pblock;
 mod transmission;
 mod tune;
 mod waypoint;
@@ -45,6 +47,8 @@ use bevy::image::{Image, ImageAddressMode, ImageFilterMode, ImageSampler, ImageS
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::camera::visibility::RenderLayers;
+use bevy::camera::{CameraOutputMode, Hdr};
+use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::ecs::observer::On;
 use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
@@ -108,6 +112,7 @@ fn main() {
                 perform_transition,
             )
                 .chain()
+                .after(input::gather)
                 .run_if(front::sim_runs),
         )
         .add_observer(queue_transition)
@@ -177,6 +182,10 @@ struct PendingTransition {
 #[derive(Resource)]
 pub(crate) struct WorldCollide(pub(crate) collide::Collider);
 
+/// Retail PBlock grid for the player. AI still uses [`WorldCollide`] and the nav grid.
+#[derive(Resource)]
+pub(crate) struct WorldPhysics(pub(crate) pblock::PBlocks);
+
 /// Where a dead player comes back, and where the fight was first placed.
 #[derive(Resource)]
 pub(crate) struct Checkpoint {
@@ -196,7 +205,24 @@ pub(crate) const BODY: f32 = 32.0;
 /// Larger than every enemy health pool in the roster.
 pub(crate) const PLAYER_HP: f32 = 500.0;
 pub(crate) const MAG_SIZE: [u16; 2] = [30, 8];
-pub(crate) const RESERVE_SIZE: [u16; 2] = [90, 24];
+/// Spare rounds behind the magazine. Ambush has no ammo pickups. The authored
+/// hostiles plus `barb1` and `barb2` are 2240 hit points, and the rifle hits
+/// for 15, so 30+90 (1800 damage) cannot clear the mission on the rifle alone.
+/// 30+360 is 390 shots: about two in five can miss and the cast is still
+/// clearable. The pulse rifle stays a short sidearm. A pack with nothing in
+/// the mag and nothing in reserve does not invent rounds.
+pub(crate) const RESERVE_SIZE: [u16; 2] = [360, 24];
+
+/// Continue keeps whatever rounds are still in the file. Both guns empty is
+/// the starting pack: reload cannot pull rounds out of an empty reserve, and
+/// Ambush never hands more out.
+pub(crate) fn carried_rounds(ammo: [u16; 2], reserve: [u16; 2]) -> ([u16; 2], [u16; 2]) {
+    if ammo == [0, 0] && reserve == [0, 0] {
+        (MAG_SIZE, RESERVE_SIZE)
+    } else {
+        (ammo, reserve)
+    }
+}
 
 /// Blended on-foot / MCA movement. `scale` 0 is the infantry body.
 pub(crate) struct BodyTune {
@@ -239,7 +265,10 @@ fn spawn_stage(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         Camera {
-            // Drawn after the sky camera, without wiping its color.
+            // Drawn after the sky camera. `None` loads the shared HDR target
+            // the sky camera just cleared. Bloom requires `Hdr`, so a sky
+            // camera that is not HDR writes a different texture and this one
+            // keeps last frame: additive flashes and the viewmodel smear.
             order: 1,
             clear_color: ClearColorConfig::None,
             ..default()
@@ -327,6 +356,7 @@ fn model_path() -> Option<String> {
 
 /// Load either a world (`SHOGO_WORLD`) or a character model (`SHOGO_MODEL`).
 fn load_asset(
+    launch: Res<front::Launch>,
     mut commands: Commands,
     meshes: ResMut<Assets<Mesh>>,
     materials: ResMut<Assets<StandardMaterial>>,
@@ -334,9 +364,10 @@ fn load_asset(
     players: Query<(&mut Player, &mut Transform)>,
     orbit_q: Query<&mut Orbit>,
 ) {
-    // A new mission boots from SHOGO_WORLD or Ambush, not the previous exit.
+    // Forget the previous exit. New Game then boots SHOGO_WORLD or Ambush.
+    // Continue boots the mission named in the save.
     forget_world();
-    if let Some(path) = world_path() {
+    if let Some(path) = boot_path(&launch) {
         commands.insert_resource(CampaignFile(path.clone()));
         load_world(path, None, commands, meshes, materials, images, players);
     } else {
@@ -561,6 +592,16 @@ fn load_world(
     }
     let ntris = tris.len();
     let collider = collide::Collider::from_tris(tris);
+    let physics = pblock::PBlocks::from_dat(&data);
+    if let Some(grid) = physics.as_ref() {
+        let dims = grid.dims();
+        info!(
+            "pblock grid {}x{}x{} block {:.0}",
+            dims[0], dims[1], dims[2], grid.block_size().x
+        );
+    } else {
+        warn!("no PBlock table; player movement uses the triangle sphere");
+    }
 
     // World positions are Y-up. A named start (the exit's StartPointName) wins.
     let starts = shogo_assets::dat::start_points(&data).unwrap_or_default();
@@ -573,10 +614,12 @@ fn load_world(
     let (spawn, face, pitch) = chosen
         .map(|s| {
             let feet = world_pos(s.pos);
-            let y = collider
-                .floor_y(feet.x, feet.z, feet.y + 128.0)
-                .map(|fy| fy + BODY)
-                .unwrap_or(feet.y);
+            let floor = if let Some(grid) = physics.as_ref() {
+                grid.floor_y(feet.x, feet.z, feet.y + 128.0)
+            } else {
+                collider.floor_y(feet.x, feet.z, feet.y + 128.0)
+            };
+            let y = floor.map(|fy| fy + BODY).unwrap_or(feet.y);
             let (yaw, pitch) = facing(s.rot);
             (Vec3::new(feet.x, y, feet.z), yaw, pitch)
         })
@@ -586,6 +629,11 @@ fn load_world(
             ((min + max) * 0.5 + Vec3::Y * 80.0, 0.0, 0.0)
         });
     commands.insert_resource(WorldCollide(collider));
+    if let Some(grid) = physics {
+        commands.insert_resource(WorldPhysics(grid));
+    } else {
+        commands.remove_resource::<WorldPhysics>();
+    }
     commands.insert_resource(Checkpoint {
         pos: spawn,
         yaw: face,
@@ -614,6 +662,35 @@ fn load_world(
         face,
         ntris
     );
+}
+
+/// Sky pass. It shares the bloom camera's HDR target, clears that target, and
+/// does not present. `Tonemapping::None` leaves the cleared sky in the buffer
+/// for the world camera to draw on. A non-HDR sky camera would clear a
+/// different texture, and the bloom camera's `ClearColorConfig::None` would
+/// keep last frame.
+fn sky_camera_parts(fov: f32) -> (Camera, Projection, Tonemapping) {
+    (
+        Camera {
+            order: 0,
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.45, 0.62, 0.78)),
+            output_mode: CameraOutputMode::Skip,
+            ..default()
+        },
+        Projection::Perspective(PerspectiveProjection {
+            near: 0.5,
+            far: 100_000.0,
+            fov,
+            ..default()
+        }),
+        Tonemapping::None,
+    )
+}
+
+fn sky_camera(fov: f32) -> impl Bundle {
+    let (camera, projection, tonemap) = sky_camera_parts(fov);
+    // Camera3d would otherwise enable dither, which warns when tonemapping is off.
+    (camera, projection, Hdr, tonemap, DebandDither::Disabled)
 }
 
 /// Follows the camera's position and stays world-aligned, so the clouds don't
@@ -831,17 +908,7 @@ fn spawn_sky(
         LevelEntity,
         SkyCam,
         Camera3d::default(),
-        Camera {
-            order: 0,
-            clear_color: ClearColorConfig::Custom(Color::srgb(0.45, 0.62, 0.78)),
-            ..default()
-        },
-        Projection::Perspective(PerspectiveProjection {
-            near: 0.5,
-            far: 100_000.0,
-            fov: BodyTune::at(0.0).fov,
-            ..default()
-        }),
+        sky_camera(BodyTune::at(0.0).fov),
         Transform::from_translation(at),
         RenderLayers::layer(1),
     ));
@@ -982,14 +1049,15 @@ fn player_move(
     time: Res<Time>,
     actions: Res<input::Actions>,
     collide: Option<Res<WorldCollide>>,
+    physics: Option<Res<WorldPhysics>>,
     mut players: Query<(&mut Player, &mut Transform, &mut Projection)>,
     enemies: Query<(&combat::Enemy, &Transform), Without<Player>>,
     doors: Query<(&script::Barricade, &Transform), Without<Player>>,
     slides: Query<(&script::SlidingDoor, &Transform), Without<Player>>,
 ) {
-    let Some(collide) = collide else {
+    if collide.is_none() && physics.is_none() {
         return;
-    };
+    }
     let dt = time.delta_secs().min(0.05);
 
     for (mut player, mut tf, mut proj) in &mut players {
@@ -1047,7 +1115,10 @@ fn player_move(
                     let angle = 1.0 - dot;
                     if angle < best_angle {
                         // check line of sight
-                        let wall_dist = collide.0.raycast(player_pos, dir, dist).unwrap_or(dist);
+                        let wall_dist = collide
+                            .as_ref()
+                            .and_then(|walls| walls.0.raycast(player_pos, dir, dist))
+                            .unwrap_or(dist);
                         if wall_dist >= dist - 20.0 {
                             best_angle = angle;
                             best_target_dir = Some(dir);
@@ -1110,7 +1181,14 @@ fn player_move(
             player.vel.y -= tune.gravity * dt;
         }
         let next = tf.translation + player.vel * dt;
-        let (mut center, mut grounded) = collide.0.depenetrate(next, player.radius);
+        let (mut center, mut grounded) = if let Some(grid) = physics.as_ref() {
+            grid.0.depenetrate(next, player.radius)
+        } else {
+            collide
+                .as_ref()
+                .map(|walls| walls.0.depenetrate(next, player.radius))
+                .unwrap_or((next, false))
+        };
         for (door, dtf) in &doors {
             if door.hp <= 0.0 {
                 continue;
@@ -1129,7 +1207,9 @@ fn player_move(
         // Catch a landing that stepped through a thin floor. Skip this while
         // moving upward, or a jump is pulled straight back onto the ground.
         if !grounded && player.vel.y <= 0.0 && center.is_finite() {
-            if let Some(fy) = collide.0.floor_y(center.x, center.z, center.y + 4.0) {
+            if let Some(fy) =
+                player_floor(physics.as_deref(), collide.as_deref(), center.x, center.z, center.y + 4.0)
+            {
                 let gap = center.y - player.radius - fy;
                 if (-0.5..24.0).contains(&gap) {
                     center.y = fy + player.radius;
@@ -1141,7 +1221,9 @@ fn player_move(
         // Shrinking back to on-foot leaves the camera floating. Pull it down
         // onto the floor while the radius is still catching up.
         if grounded && center.is_finite() {
-            if let Some(fy) = collide.0.floor_y(center.x, center.z, center.y + 8.0) {
+            if let Some(fy) =
+                player_floor(physics.as_deref(), collide.as_deref(), center.x, center.z, center.y + 8.0)
+            {
                 let gap = center.y - player.radius - fy;
                 if (0.5..player.radius).contains(&gap) {
                     center.y = fy + player.radius;
@@ -1152,6 +1234,21 @@ fn player_move(
             tf.translation = center;
         }
         player.grounded = grounded;
+    }
+}
+
+/// Player ground comes from the PBlock walk when the world has one.
+fn player_floor(
+    physics: Option<&WorldPhysics>,
+    collide: Option<&WorldCollide>,
+    x: f32,
+    z: f32,
+    max_y: f32,
+) -> Option<f32> {
+    if let Some(grid) = physics {
+        grid.0.floor_y(x, z, max_y)
+    } else {
+        collide.and_then(|walls| walls.0.floor_y(x, z, max_y))
     }
 }
 
@@ -1227,13 +1324,38 @@ fn facing(rot: [f32; 3]) -> (f32, f32) {
     (rot[1] * scale, rot[0] * scale)
 }
 
-fn dat_stem(name: &str) -> &str {
+pub(crate) fn dat_stem(name: &str) -> &str {
     let name = name.trim();
     if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".dat") {
         &name[..name.len() - 4]
     } else {
         name
     }
+}
+
+fn ambush_dat() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../extracted/SHOGO/WORLDS/01_AMBUSH.DAT")
+}
+
+/// Continue mission name, matched to a `.DAT` in the `WORLDS` directory.
+fn saved_world(mission: &str) -> Option<std::path::PathBuf> {
+    resolve_next_world(&ambush_dat(), mission)
+}
+
+/// New Game keeps the usual boot. Continue loads the saved mission, or Ambush
+/// when that name is not a world on disk.
+fn boot_path(launch: &front::Launch) -> Option<String> {
+    if let front::Launch::Continue(save) = launch {
+        if let Some(path) = saved_world(&save.mission) {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        let ambush = ambush_dat();
+        if ambush.is_file() {
+            return Some(ambush.to_string_lossy().into_owned());
+        }
+    }
+    world_path()
 }
 
 /// `02_Quarters` matches `02_QUARTERS.DAT` in the same `WORLDS` directory.
@@ -1309,6 +1431,7 @@ fn perform_transition(world: &mut World) {
     world.remove_resource::<combat::Mission>();
     world.remove_resource::<nav::WalkNav>();
     world.remove_resource::<WorldCollide>();
+    world.remove_resource::<WorldPhysics>();
     world.remove_resource::<Checkpoint>();
     world.insert_resource(CampaignFile(pending.path.clone()));
     world.insert_resource(SpawnRequest(pending.spawn.clone()));
@@ -1331,8 +1454,31 @@ fn perform_transition(world: &mut World) {
 
 #[cfg(test)]
 mod tests {
-    use super::{rotate_toward, BodyTune, BODY, GRAVITY, JUMP, RUN, WALK};
+    use super::{
+        carried_rounds, rotate_toward, sky_camera_parts, BodyTune, BODY, GRAVITY, JUMP, MAG_SIZE,
+        RESERVE_SIZE, RUN, WALK,
+    };
+    use bevy::camera::ClearColorConfig;
+    use bevy::core_pipeline::tonemapping::Tonemapping;
     use bevy::prelude::Vec3;
+
+    #[test]
+    fn dry_continue_gets_the_starting_pack_and_a_partial_pack_is_kept() {
+        assert_eq!(carried_rounds([0, 0], [0, 0]), (MAG_SIZE, RESERVE_SIZE));
+        assert_eq!(carried_rounds([4, 0], [0, 0]), ([4, 0], [0, 0]));
+        assert_eq!(carried_rounds([0, 0], [12, 0]), ([0, 0], [12, 0]));
+    }
+
+    #[test]
+    fn sky_pass_clears_the_hdr_target_the_bloom_camera_loads() {
+        let (camera, _, tonemap) = sky_camera_parts(1.0);
+        assert!(matches!(camera.clear_color, ClearColorConfig::Custom(_)));
+        assert!(matches!(
+            camera.output_mode,
+            bevy::camera::CameraOutputMode::Skip
+        ));
+        assert_eq!(tonemap, Tonemapping::None);
+    }
 
     #[test]
     fn quarters_exit_resolves_to_the_retail_dat() {
@@ -1349,6 +1495,70 @@ mod tests {
             .expect("start1");
         assert!((start.pos[0] + 80.0).abs() < 0.1);
         assert!((start.pos[2] - 1088.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn continue_selects_the_saved_dat_and_new_game_stays_on_ambush() {
+        let path = std::env::temp_dir().join(format!(
+            "shogo-continue-world-{}.sav",
+            std::process::id()
+        ));
+        let written = super::front::Save {
+            mission: "02_Quarters".into(),
+            x: 12.0,
+            y: 34.0,
+            z: 56.0,
+            yaw: 0.2,
+            pitch: -0.1,
+            health: 250.0,
+            scale: 0.0,
+            mca: false,
+            weapon: 1,
+            ammo: [7, 2],
+            reserve: [20, 4],
+        };
+        for mission in ["02_Quarters", "02_QUARTERS.DAT"] {
+            let mut save = written.clone();
+            save.mission = mission.into();
+            std::fs::write(&path, super::front::encode(&save)).expect("write save");
+            let text = std::fs::read_to_string(&path).expect("read save");
+            let parsed = super::front::decode(&text).expect("decode save");
+            let continued =
+                super::boot_path(&super::front::Launch::Continue(parsed)).expect("continue dat");
+            let continued_name = std::path::Path::new(&continued)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            assert!(
+                continued_name.eq_ignore_ascii_case("02_QUARTERS.DAT"),
+                "{mission} -> {continued_name}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+
+        super::forget_world();
+        let fresh = super::boot_path(&super::front::Launch::Fresh).expect("new game");
+        let fresh_name = std::path::Path::new(&fresh)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        assert!(
+            fresh_name.eq_ignore_ascii_case("01_AMBUSH.DAT"),
+            "{fresh_name}"
+        );
+
+        let mut missing = written;
+        missing.mission = "no_such_world".into();
+        let fallback =
+            super::boot_path(&super::front::Launch::Continue(missing)).expect("fallback");
+        let fallback_name = std::path::Path::new(&fallback)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        assert!(
+            fallback_name.eq_ignore_ascii_case("01_AMBUSH.DAT"),
+            "{fallback_name}"
+        );
     }
 
     #[test]

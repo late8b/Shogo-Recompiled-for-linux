@@ -981,22 +981,20 @@ pub(crate) fn weapons(
         };
     }
 
-    if player.reloading > 0.0 {
-        player.reloading = (player.reloading - dt).max(0.0);
-        if player.reloading == 0.0 {
-            let p = &mut *player;
-            let slot = p.weapon;
-            finish_reload(slot, &mut p.ammo, &mut p.reserve);
-        }
-    } else if player.health > 0.0
-        && should_auto_reload(
-            player.ammo[player.weapon as usize],
-            player.reserve[player.weapon as usize],
-        )
     {
-        player.reloading = RELOAD_TIME[player.weapon as usize];
-    } else if actions.reload && can_reload(player.weapon, player.ammo, player.reserve) {
-        player.reloading = RELOAD_TIME[player.weapon as usize];
+        let weapon = player.weapon;
+        let alive = player.health > 0.0;
+        let reload_pressed = actions.reload;
+        let p = &mut *player;
+        step_gun(
+            weapon,
+            &mut p.ammo,
+            &mut p.reserve,
+            &mut p.reloading,
+            dt,
+            reload_pressed,
+            alive,
+        );
     }
 
     if player.health <= 0.0 {
@@ -1567,6 +1565,30 @@ fn step_on(
 /// An empty magazine with rounds left in reserve reloads on its own.
 fn should_auto_reload(ammo: u16, reserve: u16) -> bool {
     ammo == 0 && reserve > 0
+}
+
+/// Counts a reload down and, when it finishes, moves reserve into the mag.
+/// Pressing reload with both the mag and the reserve empty does not start one.
+fn step_gun(
+    weapon: u8,
+    ammo: &mut [u16; 2],
+    reserve: &mut [u16; 2],
+    reloading: &mut f32,
+    dt: f32,
+    reload_pressed: bool,
+    alive: bool,
+) {
+    if *reloading > 0.0 {
+        *reloading = (*reloading - dt).max(0.0);
+        if *reloading == 0.0 {
+            finish_reload(weapon, ammo, reserve);
+        }
+    } else if alive
+        && (should_auto_reload(ammo[weapon as usize], reserve[weapon as usize])
+            || (reload_pressed && can_reload(weapon, *ammo, *reserve)))
+    {
+        *reloading = RELOAD_TIME[weapon as usize];
+    }
 }
 
 fn place_hud(widget: &HudWidget, fov: f32, aspect: f32) -> Transform {
@@ -2340,5 +2362,78 @@ mod tests {
         assert!(wave_plan(2).len() > 4);
         assert!(wave_plan(5).len() > wave_plan(3).len());
         assert!(DEFS.iter().all(|def| PLAYER_HP > def.health));
+    }
+
+    #[test]
+    fn reload_moves_reserve_into_an_empty_mag_and_a_dry_pack_stays_dry() {
+        let mut ammo = [0, 8];
+        let mut reserve = [90, 24];
+        let mut reloading = 0.0;
+        step_gun(0, &mut ammo, &mut reserve, &mut reloading, 0.016, true, true);
+        assert!(reloading > 0.0);
+        let mut steps = 0;
+        while reloading > 0.0 {
+            step_gun(0, &mut ammo, &mut reserve, &mut reloading, 0.05, false, true);
+            steps += 1;
+            assert!(steps < 80, "reload never finished");
+        }
+        assert_eq!(ammo[0], MAG_SIZE[0]);
+        assert_eq!(reserve[0], 90 - MAG_SIZE[0]);
+        assert_eq!(ammo[1], 8);
+        assert_eq!(reserve[1], 24);
+
+        let mut ammo = [0, 0];
+        let mut reserve = [0, 0];
+        let mut reloading = 0.0;
+        step_gun(0, &mut ammo, &mut reserve, &mut reloading, 0.05, true, true);
+        step_gun(0, &mut ammo, &mut reserve, &mut reloading, 1.0, true, true);
+        assert_eq!(ammo, [0, 0]);
+        assert_eq!(reserve, [0, 0]);
+        assert_eq!(reloading, 0.0);
+    }
+
+    /// Ambush hostiles (two Ruin 150, two troopers, two Andra 10, Sparrowhawk
+    /// and Vigilance as Andra 5) plus barb1 and barb2. UCA escorts are allies.
+    fn ambush_targets_hp() -> f32 {
+        2.0 * DEFS[EnemyKind::Ruin as usize].health
+            + 2.0 * DEFS[EnemyKind::Trooper as usize].health
+            + 2.0 * DEFS[EnemyKind::Andra10 as usize].health
+            + 2.0 * DEFS[EnemyKind::Andra5 as usize].health
+            + 200.0
+    }
+
+    #[test]
+    fn rifle_pack_still_clears_ambush_when_two_in_five_shots_miss() {
+        let shots = (MAG_SIZE[0] + RESERVE_SIZE[0]) as f32;
+        let hits = shots * 0.6;
+        let hp = ambush_targets_hp();
+        assert!(
+            hits * ASSAULT_DAMAGE > hp,
+            "{hits} hits cannot cover {hp} hp"
+        );
+    }
+
+    #[test]
+    fn shot_beam_expires_and_is_not_replaced_every_frame() {
+        use std::time::Duration;
+
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .add_systems(Update, muzzle_flashes);
+        let id = app.world_mut().spawn(ShotBeam { life: 0.05 }).id();
+        let mut beams = app.world_mut().query::<&ShotBeam>();
+        assert_eq!(beams.iter(app.world()).count(), 1);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(16));
+        app.update();
+        assert!(app.world().get::<ShotBeam>(id).is_some());
+        let mut beams = app.world_mut().query::<&ShotBeam>();
+        assert_eq!(beams.iter(app.world()).count(), 1, "the flash tick spawned another beam");
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(80));
+        app.update();
+        assert!(app.world().get::<ShotBeam>(id).is_none());
     }
 }

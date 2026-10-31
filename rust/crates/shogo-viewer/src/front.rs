@@ -1,8 +1,8 @@
 //! Title, the Ambush bumper, pause, and one continue file.
 //!
 //! New Game plays the retail bumper, then drops into mission 1. Continue
-//! restores the last save and skips the bumper. Esc pauses. F5 and the pause
-//! menu write the same file the title screen reads.
+//! reads the save, skips the bumper, and loads that mission. Esc pauses. F5
+//! and the pause menu write the same file the title screen reads.
 
 use std::path::{Path, PathBuf};
 
@@ -101,7 +101,8 @@ pub fn apply_launch(
     let Launch::Continue(save) = &*launch else {
         return;
     };
-    if !save.mission.eq_ignore_ascii_case(&world_file()) {
+    // `02_Quarters` and `02_QUARTERS.DAT` are the same mission.
+    if !same_mission(&save.mission, &world_file()) {
         return;
     }
     let Ok((mut player, mut tf)) = players.single_mut() else {
@@ -114,8 +115,12 @@ pub fn apply_launch(
     player.want_mca = save.mca;
     player.radius = crate::BodyTune::at(player.scale).radius;
     player.weapon = save.weapon.min(1);
-    player.ammo = save.ammo;
-    player.reserve = save.reserve;
+    // A continue file with both guns empty is a dead mission: Ambush has no
+    // pickups, and reload cannot move rounds that are not there. Any rounds
+    // still in the file are kept.
+    let (ammo, reserve) = crate::carried_rounds(save.ammo, save.reserve);
+    player.ammo = ammo;
+    player.reserve = reserve;
     player.vel = Vec3::ZERO;
     player.reloading = 0.0;
     tf.translation = Vec3::new(save.x, save.y, save.z);
@@ -319,10 +324,13 @@ fn drive(
             io.next.set(Screen::Intro);
         }
         Act::Continue => {
-            if let Some(save) = read_save() {
-                *io.launch = Launch::Continue(save);
-                io.next.set(Screen::Mission);
-            }
+            // Parsed before Mission enter, so the loader can boot this world.
+            // A missing or unreadable file still enters Ambush, and skips the bumper.
+            *io.launch = match read_save() {
+                Some(save) => Launch::Continue(save),
+                None => Launch::Fresh,
+            };
+            io.next.set(Screen::Mission);
         }
         Act::Quit => {
             io.exit.write(AppExit::Success);
@@ -566,6 +574,12 @@ fn world_file() -> String {
         .unwrap_or_else(|| "01_AMBUSH.DAT".into())
 }
 
+fn same_mission(saved: &str, loaded: &str) -> bool {
+    let saved = crate::dat_stem(saved);
+    let loaded = crate::dat_stem(loaded);
+    !saved.is_empty() && saved.eq_ignore_ascii_case(loaded)
+}
+
 pub fn continue_path() -> PathBuf {
     if let Ok(path) = std::env::var("SHOGO_SAVE") {
         if !path.is_empty() {
@@ -754,6 +768,14 @@ mod tests {
             ammo: [10, 3],
             reserve: [40, 8],
         }
+    }
+
+    #[test]
+    fn quarters_stem_matches_the_loaded_dat() {
+        assert!(same_mission("02_Quarters", "02_QUARTERS.DAT"));
+        assert!(same_mission("02_QUARTERS.DAT", "02_QUARTERS.DAT"));
+        assert!(!same_mission("02_Quarters", "01_AMBUSH.DAT"));
+        assert!(!same_mission("no_such_world", "01_AMBUSH.DAT"));
     }
 
     #[test]
